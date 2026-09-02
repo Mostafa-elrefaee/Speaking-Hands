@@ -1,0 +1,6 @@
+mediapipe
+opencv-python
+tensorflow
+numpy
+pyttsx3
+pytest  # tests only

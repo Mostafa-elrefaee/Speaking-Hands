@@ -18,6 +18,14 @@ This repository contains the following contents.
 * Tensorflow 2.3.0 or Later<br>tf-nightly 2.5.0.dev or later (Only when creating a TFLite for an LSTM model)
 * scikit-learn 0.23.2 or Later (Only if you want to display the confusion matrix) 
 * matplotlib 3.3.2 or Later (Only if you want to display the confusion matrix)
+* pyttsx3 (offline text-to-speech; on Linux also install `espeak-ng`, e.g. `sudo apt install espeak-ng`)
+
+# Text-to-speech
+When a gesture is predicted for `--tts_stable_frames` consecutive frames it is spoken
+aloud once (offline, via pyttsx3, on a background thread so the video never stalls).
+The same word is not repeated until a *different* gesture stabilizes. The last spoken
+word is shown top-right as `Spoken: ...`. Logic lives in `tts_speaker.py`;
+tests in `tests/` (`python -m pytest tests/ -v`, no webcam needed).
 
 # Demo
 Here's how to run the demo using your webcam.
@@ -32,6 +40,9 @@ The following options can be specified when running the demo.
 * --use_static_image_mode<br>Whether to use static_image_mode option for MediaPipe inference (Default：Unspecified)
 * --min_detection_confidence<br>
 Detection confidence threshold (Default：0.5)
+* --no_tts<br>Disable spoken output; on-screen text only (Default：TTS on)
+* --tts_stable_frames<br>How many consecutive identical predictions are needed before a gesture is spoken (Default：10)
+* --tts_rate<br>Speech rate in words per minute (Default：pyttsx3's default)
 * --min_tracking_confidence<br>
 Tracking confidence threshold (Default：0.5)
 

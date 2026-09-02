@@ -19,17 +19,43 @@ has been removed. It was built around a single dominant hand's fingertip
 and doesn't have a sensible meaning once both hands are combined into one
 gesture -- it was also unrelated to sign-language recognition to begin
 with.
+
+Motion signs: a rolling deque of combined vectors feeds the optional
+SequenceClassifier every frame alongside the static KeyPointClassifier
+(sequence wins when confident, static is the fallback). The result is
+debounced by gesture_output.GestureStabilizer and that ONE stabilized value
+is both drawn on screen and spoken via pyttsx3 on a background thread.
 """
+import os
 import csv
 import copy
 import argparse
+from collections import deque
 
 import cv2 as cv
 import mediapipe as mp
 
 from utils import CvFpsCalc
 from model import KeyPointClassifier
-from landmark_utils import build_combined_vector
+from landmark_utils import build_combined_vector, TOTAL_FEATURES
+from gesture_output import (choose_gesture, GestureStabilizer, SpeechWorker)
+from camera_utils import open_camera
+
+# How many consecutive frames a raw prediction must agree before it becomes
+# the "current gesture" that is drawn AND spoken. At ~30 fps, 8 frames is
+# ~0.27 s: long enough to swallow 1-3 frame classifier flicker and most of the
+# static/sequence disagreement at the onset of a motion sign, short enough
+# that a fluent signer holding each word for ~0.4 s+ still gets every word.
+STABLE_FRAMES = 8
+
+# Consecutive no-hand frames after which the sequence buffer is reset.
+# Shorter dropouts keep the buffer as-is (training data skips no-hand frames
+# too, see extract_gesture_data.py), longer gaps mean a new sign is starting
+# and stale pre-gap frames would only mislead the sequence model.
+MAX_MISSING_FRAMES = 5
+
+SEQ_MODEL_PATH = 'model/sequence_classifier/sequence_classifier.tflite'
+SEQ_LABEL_PATH = 'model/sequence_classifier/sequence_classifier_label.csv'
 
 
 def get_args():
@@ -49,6 +75,17 @@ def get_args():
                         help='min_tracking_confidence',
                         type=float,
                         default=0.5)
+
+    parser.add_argument("--seq_model", type=str, default=SEQ_MODEL_PATH)
+    parser.add_argument("--seq_label", type=str, default=SEQ_LABEL_PATH)
+    parser.add_argument("--seq_score_th", type=float, default=0.5,
+                        help='sequence classifier confidence threshold')
+    parser.add_argument("--stable_frames", type=int, default=STABLE_FRAMES)
+    parser.add_argument("--no_tts", action='store_true',
+                        help='disable spoken output')
+    parser.add_argument("--backend", choices=["auto", "dshow", "msmf", "any"],
+                        default="auto",
+                        help='camera backend (auto = dshow, then msmf on Windows)')
 
     args = parser.parse_args()
 
@@ -71,9 +108,9 @@ def main():
     use_brect = True
 
     # Camera preparation ###############################################################
-    cap = cv.VideoCapture(cap_device)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
+    # open_camera() picks a backend that actually delivers a real image
+    # (see camera_utils.py) instead of trusting cv.VideoCapture(0).
+    cap, _backend = open_camera(cap_device, args.backend, cap_width, cap_height)
 
     # Model load #############################################################
     mp_hands = mp.solutions.hands
@@ -94,11 +131,78 @@ def main():
             row[0] for row in keypoint_classifier_labels
         ]
 
+    # Sequence (motion) classifier -- optional, degrades to static-only ######
+    sequence_classifier, sequence_classifier_labels = load_sequence_classifier(
+        args.seq_model, args.seq_label, args.seq_score_th)
+    seq_len = sequence_classifier.seq_length if sequence_classifier else 1
+    seq_buffer = deque(maxlen=int(seq_len))
+
+    # Stabilizer + TTS: ONE stabilized "current gesture" feeds both ##########
+    stabilizer = GestureStabilizer(args.stable_frames)
+    speaker = None
+    if not args.no_tts:
+        speaker = SpeechWorker().start()  # raises with an actionable message
+
     # FPS Measurement ########################################################
     cvFpsCalc = CvFpsCalc(buffer_len=10)
 
-    #  ########################################################################
+    try:
+        run_loop(cap, hands, keypoint_classifier, keypoint_classifier_labels,
+                 sequence_classifier, sequence_classifier_labels, seq_buffer,
+                 stabilizer, speaker, cvFpsCalc, use_brect)
+    finally:
+        cap.release()
+        cv.destroyAllWindows()
+        if speaker is not None:
+            speaker.close()
+
+
+def load_sequence_classifier(model_path, label_path, score_th):
+    """Returns (SequenceClassifier, labels) or (None, None) with ONE clear
+    console message if the motion model can't be used yet."""
+    if not os.path.exists(model_path) or not os.path.exists(label_path):
+        print(f"[info] No sequence classifier found ({model_path} / "
+              f"{label_path}). Running STATIC-ONLY. Train one with "
+              "extract_gesture_data.py --mode sequence + "
+              "train_sequence_classifier.py to enable motion signs.")
+        return None, None
+
+    from model.sequence_classifier.sequence_classifier import SequenceClassifier
+    clf = SequenceClassifier(model_path=model_path, score_th=score_th)
+    with open(label_path, encoding='utf-8-sig') as f:
+        labels = [row[0] for row in csv.reader(f) if row]
+
+    # Same guard rails as the training scripts: never trust hand-typed sizes.
+    num_classes = int(clf.output_details[0]['shape'][-1])
+    if len(labels) < 2:
+        print(f"[warn] {label_path} has only {len(labels)} label(s). A "
+              "1-class model always predicts that class with 100% "
+              "confidence, so it would override the static classifier on "
+              "every frame. Extract at least one more gesture (e.g. a 'rest' "
+              "class of idle hands) and retrain. Running STATIC-ONLY.")
+        return None, None
+    if int(clf.num_features) != TOTAL_FEATURES:
+        print(f"[warn] {model_path} expects {clf.num_features} features per "
+              f"frame but landmark_utils.TOTAL_FEATURES is {TOTAL_FEATURES}. "
+              "It was trained on a different vector format -- retrain it. "
+              "Running STATIC-ONLY.")
+        return None, None
+    if num_classes != len(labels):
+        print(f"[warn] {model_path} outputs {num_classes} classes but "
+              f"{label_path} has {len(labels)} labels. Run "
+              "diagnose_label_mismatch.py. Running STATIC-ONLY.")
+        return None, None
+
+    print(f"[info] Sequence classifier loaded: seq_length={clf.seq_length}, "
+          f"{num_classes} labels, score_th={score_th}")
+    return clf, labels
+
+
+def run_loop(cap, hands, keypoint_classifier, keypoint_classifier_labels,
+             sequence_classifier, sequence_classifier_labels, seq_buffer,
+             stabilizer, speaker, cvFpsCalc, use_brect):
     mode = 0
+    missing_frames = 0
 
     while True:
         fps = cvFpsCalc.get()
@@ -129,29 +233,55 @@ def main():
         combined_vector, per_hand_info = build_combined_vector(
             debug_image, results.multi_hand_landmarks, results.multi_handedness)
 
+        raw_gesture, source = None, None
         if per_hand_info:  # at least one hand detected
+            missing_frames = 0
             # Write to the dataset file (data-collection mode, 'k' key)
             logging_csv(number, mode, combined_vector)
 
-            # ONE prediction for the whole (one- or two-handed) gesture
-            hand_sign_id = keypoint_classifier(combined_vector)
-            gesture_text = keypoint_classifier_labels[hand_sign_id]
+            # Rolling window for the motion model. Only hand-present frames
+            # are appended -- identical to how extract_gesture_data.py builds
+            # the training windows. A missing SECOND hand is already
+            # zero-filled inside combined_vector.
+            seq_buffer.append(combined_vector)
 
-            # Drawing: each hand's skeleton + box, one shared gesture label
+            # ONE static prediction for the whole (one- or two-handed) gesture
+            hand_sign_id = keypoint_classifier(combined_vector)
+            static_label = keypoint_classifier_labels[hand_sign_id]
+
+            # Sequence prediction (wrapper returns invalid_value until the
+            # buffer holds seq_length frames or when confidence is low)
+            seq_label = None
+            if sequence_classifier is not None:
+                seq_id = sequence_classifier(seq_buffer)
+                if seq_id != sequence_classifier.invalid_value:
+                    seq_label = sequence_classifier_labels[seq_id]
+
+            raw_gesture, source = choose_gesture(seq_label, static_label)
+
+            # Drawing: each hand's skeleton + box
             for side, landmark_list, brect in per_hand_info:
                 debug_image = draw_bounding_rect(use_brect, debug_image, brect)
                 debug_image = draw_landmarks(debug_image, landmark_list)
                 debug_image = draw_hand_tag(debug_image, brect, side)
+        else:
+            missing_frames += 1
+            if missing_frames == MAX_MISSING_FRAMES:
+                seq_buffer.clear()
 
-            debug_image = draw_gesture_text(debug_image, gesture_text)
+        # Single source of truth: the stabilized gesture drives BOTH the
+        # on-screen label and the speech output. `changed` fires exactly once
+        # per stabilization to a new value.
+        current_gesture, changed = stabilizer.update(raw_gesture)
+        if changed and current_gesture is not None and speaker is not None:
+            speaker.say(current_gesture)
 
+        debug_image = draw_gesture_text(debug_image, current_gesture)
+        debug_image = draw_raw_gesture(debug_image, raw_gesture, source)
         debug_image = draw_info(debug_image, fps, mode, number)
 
         # Screen reflection #############################################################
         cv.imshow('Hand Gesture Recognition', debug_image)
-
-    cap.release()
-    cv.destroyAllWindows()
 
 
 def select_mode(key, mode):
@@ -313,6 +443,17 @@ def draw_gesture_text(image, gesture_text):
                cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4, cv.LINE_AA)
     cv.putText(image, "Gesture: " + gesture_text, (10, 60),
                cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv.LINE_AA)
+    return image
+
+
+def draw_raw_gesture(image, raw_gesture, source):
+    """Small per-frame debug line: the un-debounced prediction and which
+    classifier produced it. Useful for tuning --seq_score_th/--stable_frames;
+    the big label above is the stabilized value users actually get."""
+    if raw_gesture is None:
+        return image
+    cv.putText(image, f"raw: {raw_gesture} ({source})", (10, 130),
+               cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
     return image
 
 
