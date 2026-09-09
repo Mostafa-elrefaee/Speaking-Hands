@@ -1,0 +1,23 @@
+# Realtime profile for app.py:  python app.py --config configs/realtime.yaml
+# Default 20 FPS processing with the profiling overlay and the original
+# per-word pyttsx3 subprocess backend (pre-spawned). Add --benchmark to write
+# experiments/realtime/<stamp>_realtime_benchmark.json on exit.
+name: realtime
+stabilizer:
+  confidence_threshold: 0.5
+  stable_count: 8
+  averaging_window: 1
+realtime:
+  target_fps: 20.0
+  max_queue_size: 1
+  latest_frame_strategy: true
+  drop_stale_frames: true
+  stale_frame_max_age_s: 0.25
+  model_complexity: 1          # try 0 if landmark_ms is the bottleneck
+  debug_overlay_enabled: true
+tts:
+  backend: pyttsx3_subprocess
+  prespawn: true
+  queue_size: 2
+  max_pending_age_ms: 1500.0
+  label_map: {}                # e.g. {Hi: hello, fk: okay}

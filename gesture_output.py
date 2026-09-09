@@ -14,12 +14,30 @@ is being shown right now". Both the screen and the speech output read from
 it; there is deliberately no second debounce for speech.
 
 This module has no cv2 / mediapipe / tensorflow imports so it can be unit
-tested with plain fake predictions (see test_gesture_output.py).
+tested with plain fake predictions (see tests/test_gesture_output.py).
+
+Research extension (sh_research integration):
+  * PredictionStabilizer wraps GestureStabilizer with optional probability
+    smoothing / majority voting / confidence gate / cooldown, and turns each
+    stabilization into a timestamped StableEvent for the speech-event manager
+    and the latency benchmarks. With the default StabilizerConfig it behaves
+    exactly like GestureStabilizer(stable_frames) + the old --seq_score_th gate.
+  * SpeechWorker is now a thin compatibility wrapper over
+    sh_research.tts.TTSWorker (bounded queue, stale-event expiry, measured
+    T4..T7 timestamps). The pyttsx3-subprocess backend it used lives in
+    sh_research/tts/backends.py unchanged in behaviour.
 """
-import sys
-import queue
-import threading
-import subprocess
+import time
+from collections import Counter, deque
+from dataclasses import dataclass
+from typing import Deque, List, Optional
+
+import numpy as np
+
+from sh_research.config import StabilizerConfig
+from sh_research.tts.backends import (Pyttsx3Backend, Pyttsx3SubprocessBackend,  # noqa: F401 (re-exported)
+                                      create_pyttsx3_engine)
+from sh_research.tts.worker import TTSWorker
 
 
 # ---------------------------------------------------------------------------
@@ -99,197 +117,194 @@ class GestureStabilizer(object):
 
 
 # ---------------------------------------------------------------------------
-# Text-to-speech on a background thread
+# Research stabilizer: probabilities -> gate -> GestureStabilizer -> StableEvent
 # ---------------------------------------------------------------------------
 
-def create_pyttsx3_engine():
-    """Import + init pyttsx3 with actionable errors instead of tracebacks."""
-    try:
-        import pyttsx3
-    except ImportError:
-        raise RuntimeError(
-            "Text-to-speech needs the 'pyttsx3' package, which is not "
-            "installed. Fix:  pip install pyttsx3   (or run app.py with "
-            "--no_tts to disable speech)")
-    try:
-        return pyttsx3.init()
-    except Exception as e:  # pyttsx3 raises plain RuntimeError/OSError
-        hint = ""
-        if "espeak" in str(e).lower():
-            hint = ("  On Linux pyttsx3 needs eSpeak:  "
-                    "sudo apt install espeak-ng")
-        raise RuntimeError(
-            "pyttsx3 is installed but could not start a speech engine: "
-            f"{e}.{hint}  (or run app.py with --no_tts)")
+@dataclass
+class StableEvent:
+    """One stabilization ("this gesture is now current") with the timestamps
+    the latency measurements need."""
+    label_index: int
+    label: str
+    confidence: float
+    confirmed_at: float            # T2: monotonic time the decision was made
+    frames_to_confirm: int         # consecutive frames the label was seen
+    frame_captured_at: Optional[float] = None  # T0: capture time of the confirming frame
+    predicted_at: Optional[float] = None       # T1: when the model produced the prediction
+    stable_since: Optional[float] = None       # when this label's streak started
+    source: Optional[str] = None               # "seq" / "static" (from choose_gesture)
 
 
-# Script run once PER WORD in a fresh Python process. pyttsx3 has a long-
-# standing bug where the SECOND engine.runAndWait() on the same engine hangs
-# (Windows SAPI5) or goes silent (macOS) -- only Linux/eSpeak is immune. A
-# fresh process per utterance sidesteps it on every platform; the ~0.2-0.5 s
-# startup happens on the background thread, never in the camera loop.
-_SPEAK_SCRIPT = (
-    "import sys, pyttsx3\n"
-    "e = pyttsx3.init()\n"
-    "e.say(sys.argv[1])\n"
-    "e.runAndWait()\n"
-)
+class ProbabilitySmoother(object):
+    """Optional pre-processing of a classifier's probability vectors:
+    moving average over `averaging_window` frames and/or majority vote over
+    the last `voting_window` argmaxes. Both off = pass-through."""
+
+    def __init__(self, averaging_window=1, voting_window=0):
+        self.averaging_window = max(1, int(averaging_window))
+        self.voting_window = max(0, int(voting_window))
+        self._probs: Deque[np.ndarray] = deque(maxlen=max(self.averaging_window, self.voting_window, 1))
+        self._votes: Deque[int] = deque(maxlen=max(1, self.voting_window))
+
+    def reset(self):
+        self._probs.clear()
+        self._votes.clear()
+
+    def update(self, probs):
+        """-> (label_index, confidence) after smoothing."""
+        probs = np.asarray(probs, dtype=np.float32).reshape(-1)
+        self._probs.append(probs)
+        if self.voting_window > 0:
+            self._votes.append(int(probs.argmax()))
+            label = Counter(self._votes).most_common(1)[0][0]
+            recent = list(self._probs)[-self.voting_window:]
+            conf = float(np.mean([p[label] for p in recent]))
+            return label, conf
+        recent = list(self._probs)[-self.averaging_window:]
+        smoothed = np.mean(recent, axis=0)
+        label = int(smoothed.argmax())
+        return label, float(smoothed[label])
 
 
-def speak_in_subprocess(text, timeout=15.0):
-    """Blocking: speak `text` in an isolated process. Returns the Popen so a
-    caller can terminate it on shutdown."""
-    return subprocess.Popen([sys.executable, "-c", _SPEAK_SCRIPT, text],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-
-class SpeechWorker(object):
+class PredictionStabilizer(object):
     """
-    Speaks strings on a daemon thread so the webcam loop never blocks.
+    prediction -> [smoother] -> confidence gate -> GestureStabilizer -> StableEvent
 
-    Policy when a new gesture stabilizes while speech is playing: QUEUE it,
-    don't interrupt. Every stabilized gesture is a word the signer meant to
-    say; cutting one off mid-word (or dropping it) changes the sentence,
-    while a short bounded delay does not. Utterances are single words
-    (~0.3-0.6 s), so the backlog stays small. `maxsize` is only a safety
-    valve: if it is ever hit, the OLDEST queued (not-yet-spoken) word is
-    dropped and a warning printed, so speech can't lag unboundedly.
+    Two entry points share the same debounce so there is exactly ONE
+    stability mechanism in the project:
+
+      update(probs, ...)         one classifier's probability vector per frame
+                                 (research benchmarks, single-model pipelines)
+      commit(raw_label, ...)     an already-chosen label per frame -- app.py
+                                 calls smooth() on the sequence probabilities,
+                                 arbitrates with choose_gesture(), then commit()
+
+    `current` is the stabilized gesture (or None), exactly as
+    GestureStabilizer.current was, and drives both the screen and the speech.
+    """
+
+    def __init__(self, cfg: StabilizerConfig, class_names=None):
+        self.cfg = cfg
+        self.class_names = list(class_names) if class_names else []
+        self.smoother = ProbabilitySmoother(cfg.averaging_window, cfg.voting_window)
+        self.debounce = GestureStabilizer(cfg.stable_count)
+        self._streak_start: float = 0.0
+        self._last_emit_t: float = -1e9
+        self._last_emit_label: Optional[str] = None
+        self._last_emit_label_t: float = -1e9
+        self.events_emitted = 0
+        self.updates = 0
+        self.suppressed = 0
+
+    # -- state ----------------------------------------------------------------
+    @property
+    def current(self):
+        return self.debounce.current
+
+    def reset(self):
+        """Forget the smoothing history and the running streak (used when the
+        sequence window is cleared). `current` is kept, as before."""
+        self.smoother.reset()
+        self.debounce._candidate = None
+        self.debounce._run_length = 0
+
+    # -- step 1: probabilities -> gated label --------------------------------------
+    def smooth(self, probs):
+        """-> (label_index or None, confidence). None = below confidence_threshold."""
+        label, conf = self.smoother.update(probs)
+        if conf < self.cfg.confidence_threshold:
+            return None, conf
+        return label, conf
+
+    # -- step 2: gated label -> stabilized event -----------------------------------
+    def commit(self, raw_label, confidence=1.0, now=None, frame_captured_at=None,
+               predicted_at=None, source=None):
+        """Feed this frame's chosen raw label (a string, or None for "no
+        gesture"). Returns a StableEvent on the frame `current` switches to a
+        new non-None value, else None."""
+        now = time.monotonic() if now is None else now
+        self.updates += 1
+        prev_candidate = self.debounce._candidate
+        current, changed = self.debounce.update(raw_label)
+        if raw_label != prev_candidate:
+            self._streak_start = now
+        if not changed or current is None:
+            return None
+        # optional extras (all off by default -> pure GestureStabilizer behaviour)
+        if now - self._last_emit_t < self.cfg.cooldown_s:
+            self.suppressed += 1
+            return None
+        if (self.cfg.duplicate_suppression and current == self._last_emit_label
+                and now - self._last_emit_label_t < self.cfg.repeat_after_s):
+            self.suppressed += 1
+            return None
+        self._last_emit_t = now
+        self._last_emit_label, self._last_emit_label_t = current, now
+        self.events_emitted += 1
+        idx = self.class_names.index(current) if current in self.class_names else -1
+        return StableEvent(idx, current, float(confidence), now, self.debounce._run_length,
+                           frame_captured_at, predicted_at if predicted_at is not None else now,
+                           self._streak_start, source)
+
+    def update(self, probs, now=None, frame_captured_at=None, predicted_at=None):
+        """Single-classifier path: probability vector -> StableEvent or None."""
+        label, conf = self.smooth(probs)
+        raw = self.class_names[label] if (label is not None and self.class_names) else \
+            (str(label) if label is not None else None)
+        return self.commit(raw, conf, now, frame_captured_at, predicted_at)
+
+    @property
+    def state(self):
+        return {"current": self.current, "candidate": self.debounce._candidate,
+                "streak": self.debounce._run_length}
+
+
+# ---------------------------------------------------------------------------
+# Text-to-speech on a background thread (compatibility wrapper)
+# ---------------------------------------------------------------------------
+
+class SpeechWorker(TTSWorker):
+    """
+    The original app.py speech API (say / pending / spoken / close) on top of
+    sh_research.tts.TTSWorker.
 
     Backends:
-      * default (engine_factory=None): one subprocess per word -- see
-        _SPEAK_SCRIPT for why. Robust on Windows / macOS / Linux.
-      * engine_factory given: in-process, but a FRESH engine per word
-        (engine.stop() + drop the reference after each utterance). Used by
-        the tests with a fake engine; also usable on Linux if you'd rather
-        avoid process spawns.
+      * default (engine_factory=None): one pyttsx3 subprocess per word --
+        Pyttsx3SubprocessBackend, the original approach, now with measured
+        audio-start timestamps and an optional pre-spawned standby process.
+      * engine_factory given: in-process, a FRESH engine per word
+        (Pyttsx3Backend). Used by the tests with a fake engine; also usable on
+        Linux if you'd rather avoid process spawns.
+
+    `maxsize` maps to the bounded queue (the old default was 16; the research
+    default is TTSConfig.queue_size = 2 so speech can never lag behind signs).
     """
 
-    def __init__(self, engine_factory=None, maxsize=16):
-        self._engine_factory = engine_factory
-        self._queue = queue.Queue(maxsize=maxsize)
-        self._ready = threading.Event()
-        self._init_error = None
-        self._dropped = 0
-        self._child = None          # in-flight subprocess (subprocess mode)
-        self._closing = False
-        self._thread = threading.Thread(target=self._run, name="tts-worker",
-                                        daemon=True)
-        self.spoken = []  # everything successfully spoken (for tests / debug)
-
-    # -- lifecycle -----------------------------------------------------------
+    def __init__(self, engine_factory=None, maxsize=None, cfg=None):
+        from sh_research.config import TTSConfig
+        if cfg is None:  # classic constructor: the original 16-deep queue
+            cfg = TTSConfig(queue_size=16 if maxsize is None else int(maxsize))
+        elif maxsize is not None:
+            cfg.queue_size = int(maxsize)
+        if engine_factory is not None:
+            backend = Pyttsx3Backend(cfg.rate, cfg.volume, cfg.voice, engine_factory=engine_factory)
+        elif cfg.backend == "pyttsx3_subprocess":
+            backend = Pyttsx3SubprocessBackend(cfg.rate, cfg.volume, cfg.voice, prespawn=cfg.prespawn)
+        else:
+            backend = None  # make_backend(cfg.backend)
+        super().__init__(cfg, backend)
 
     def start(self, init_timeout=15.0):
-        """Start the thread and wait for a one-time engine probe, so a
+        """Start the thread and wait for the one-time engine probe, so a
         missing/broken TTS backend fails loudly here rather than silently
         inside the thread later."""
-        self._thread.start()
-        if not self._ready.wait(init_timeout):
-            raise RuntimeError("Speech engine did not initialise within "
-                               f"{init_timeout}s")
-        if self._init_error is not None:
-            raise self._init_error
-        return self
-
-    def close(self, timeout=3.0):
-        """Ask the thread to exit; kill any in-flight utterance. Never
-        raises; never blocks longer than `timeout` (and the thread is a
-        daemon, so even a stuck backend can't keep the process alive)."""
-        self._closing = True
-        try:
-            self._queue.put_nowait(None)
-        except queue.Full:
-            while True:
-                try:
-                    self._queue.get_nowait()
-                except queue.Empty:
-                    break
-            self._queue.put_nowait(None)
-        child = self._child
-        if child is not None:
-            try:
-                child.terminate()
-            except Exception:
-                pass
-        if self._thread.is_alive():
-            self._thread.join(timeout)
-
-    # -- producer side (main loop) --------------------------------------------
+        return super().start(wait_ready=True, init_timeout=init_timeout)
 
     def say(self, text):
         if not text:
             return
-        try:
-            self._queue.put_nowait(text)
-        except queue.Full:
-            try:
-                dropped = self._queue.get_nowait()
-            except queue.Empty:
-                dropped = None
-            self._dropped += 1
-            print(f"[tts] speech backlog full, dropped oldest unspoken "
-                  f"word: {dropped!r}")
-            self._queue.put_nowait(text)
+        self.speak(text)
 
     @property
-    def pending(self):
-        return self._queue.qsize()
-
-    # -- worker thread -------------------------------------------------------
-
-    def _probe(self):
-        """Create-and-discard one engine so import/driver errors surface."""
-        factory = self._engine_factory or create_pyttsx3_engine
-        engine = factory()
-        try:
-            stop = getattr(engine, "stop", None)
-            if stop is not None:
-                stop()
-        except Exception:
-            pass
-        del engine
-
-    def _speak_one(self, text):
-        if self._engine_factory is None:
-            self._child = speak_in_subprocess(text)
-            try:
-                _, err = self._child.communicate()
-                rc = self._child.returncode
-            finally:
-                self._child = None
-            if rc != 0 and not self._closing:
-                tail = (err or b"").decode(errors="replace").strip().splitlines()
-                raise RuntimeError(tail[-1] if tail else f"exit code {rc}")
-        else:
-            engine = self._engine_factory()
-            try:
-                engine.say(text)
-                engine.runAndWait()
-            finally:
-                try:
-                    stop = getattr(engine, "stop", None)
-                    if stop is not None:
-                        stop()
-                except Exception:
-                    pass
-                del engine  # let pyttsx3's cached engine die before the next init
-
-    def _run(self):
-        try:
-            self._probe()
-        except Exception as e:
-            self._init_error = e
-            self._ready.set()
-            return
-        self._ready.set()
-
-        while True:
-            item = self._queue.get()
-            if item is None:
-                break
-            try:
-                self._speak_one(item)
-                self.spoken.append(item)
-            except Exception as e:
-                # A failed utterance must not kill the worker or the app.
-                if not self._closing:
-                    print(f"[tts] failed to speak {item!r}: {e}")
+    def spoken(self):
+        return self.spoken_texts

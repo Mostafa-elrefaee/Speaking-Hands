@@ -1,0 +1,134 @@
+# Speaking Hands -- default research configuration.
+#
+# Every value here equals the dataclass default in sh_research/config.py, which
+# in turn reproduces the ORIGINAL project behaviour (train_sequence_classifier.py,
+# app.py flags, gesture_output.py). Copy this file, change what you study, and
+# pass it with  scripts/train.py --config <file>  or  app.py --config <file>.
+# Any key can also be overridden on the command line:  --set model.hidden_size=128
+name: default
+output_dir: experiments
+seeds: [1, 42, 123, 2026]
+latency_samples: 200
+notes: ""
+
+data:
+  # Produced by:  python extract_gesture_data.py --video <clip> --label <name> --mode sequence
+  path: model/sequence_classifier/sequence_data.csv
+  label_path: model/sequence_classifier/sequence_classifier_label.csv
+  dataset_id: ""            # free text; a content fingerprint is always recorded too
+  sequence_length: 30       # frames per window (extract_gesture_data.py default)
+  resample: tail            # uniform | tail | head  (only if the CSV window length differs)
+  source_fps: 30.0          # frame rate the windows were recorded at (assumption unless --sample_fps was used)
+  sampling_fps: 30.0        # < source_fps subsamples frames before length adaptation
+  feature_layout: {left_hand: [0, 42], right_hand: [42, 84]}   # landmark_utils.build_combined_vector
+  feature_groups: []        # [] = all 84 values; e.g. [right_hand] for a one-hand ablation
+  normalize: none           # none | standard | minmax  (fitted on the train split only)
+  split_strategy: stratified   # stratified | signer
+  val_fraction: 0.15
+  test_fraction: 0.15
+  val_signers: []
+  test_signers: []
+  split_seed: 0
+  signers_path: ""          # optional JSON {row_index: signer_id}
+
+model:
+  architecture: lstm        # mlp | gru | lstm | gru_lstm
+  hidden_size: 64
+  num_layers: 2
+  bidirectional: false
+  dropout: 0.2
+  recurrent_dropout: 0.0
+  pooling: last             # last | mean | max | mean_max
+  gru_hidden_size: 0        # gru_lstm only; 0 = hidden_size
+  lstm_hidden_size: 0
+  gru_num_layers: 0         # gru_lstm only; 0 = num_layers
+  lstm_num_layers: 0
+  mlp_hidden_layers: [128, 64]
+  dense_layers: [32]
+  activation: relu
+  normalization: none       # none | batch | layer
+  head_dropout: 0.0
+
+training:
+  optimizer: adam           # adam | adamw | sgd | rmsprop
+  learning_rate: 0.001
+  weight_decay: 0.0
+  momentum: 0.9
+  batch_size: 32
+  epochs: 150
+  label_smoothing: 0.0
+  gradient_clip_norm: 0.0
+  scheduler: none           # none | step | cosine | plateau
+  scheduler_step_size: 10
+  scheduler_gamma: 0.5
+  scheduler_patience: 5
+  scheduler_min_lr: 1.0e-6
+  early_stopping_patience: 20
+  monitor: val_loss
+  seed: 42
+  deterministic_ops: false
+  device: auto
+  verbose: 1
+  export_tflite: true       # write model.tflite (the format app.py runs)
+
+stabilizer:                 # gesture_output.PredictionStabilizer
+  confidence_threshold: 0.5 # was --seq_score_th
+  stable_count: 8           # was --stable_frames
+  averaging_window: 1       # 1 = off
+  voting_window: 0          # 0 = off
+  cooldown_s: 0.0
+  duplicate_suppression: false
+  repeat_after_s: 3.0
+  max_missing_frames: 5     # was MAX_MISSING_FRAMES
+
+realtime:
+  camera_index: 0
+  camera_width: 960
+  camera_height: 540
+  camera_backend: auto
+  max_num_hands: 2
+  use_static_image_mode: false
+  min_detection_confidence: 0.7
+  min_tracking_confidence: 0.5
+  model_complexity: 1       # MediaPipe Hands: 0 = lite (faster), 1 = full
+  target_fps: 20.0          # ML processing rate; 0 = every frame, synchronously (original loop)
+  max_catchup_intervals: 2
+  max_queue_size: 1         # latest-frame mailbox between capture thread and processing
+  latest_frame_strategy: true
+  drop_stale_frames: true
+  stale_frame_max_age_s: 0.25
+  max_sequence_gap_intervals: 3.0
+  latency_window: 500
+  profiling_enabled: true
+  debug_overlay_enabled: true
+  log_every_s: 0.0
+  benchmark: false
+  benchmark_dir: experiments/realtime
+  show_window: true
+
+tts:
+  enabled: true
+  backend: pyttsx3_subprocess   # pyttsx3_subprocess | pyttsx3 | print | mock
+  rate: 0                   # 0 = engine default
+  volume: 0.0               # 0 = engine default
+  voice: ""
+  prewarm: true
+  prespawn: true            # subprocess backend: keep one initialised process on standby
+  mode: immediate_word      # immediate_word | buffered_phrase
+  duplicate_cooldown_ms: 0.0
+  require_prediction_change: false
+  minimum_stable_duration_ms: 0.0
+  phrase_max_words: 4
+  phrase_timeout_ms: 1500.0
+  label_map: {}             # e.g. {fk: okay, Hi: hello}
+  unknown_label_policy: speak_label
+  split_label_words: false
+  capitalization: none
+  punctuation: false
+  queue_size: 2
+  overflow_policy: drop_oldest
+  max_pending_age_ms: 1500.0
+  interrupt_current_audio: false
+  duplicate_window_s: 0.0
+  mock_latency_s: 0.05
+  mock_init_s: 0.0

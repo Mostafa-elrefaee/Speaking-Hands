@@ -1,0 +1,5 @@
+name: bi_layers
+grid:
+  model.bidirectional: [false, true]
+  model.num_layers: [1, 2]
+seeds: [1, 42, 123]

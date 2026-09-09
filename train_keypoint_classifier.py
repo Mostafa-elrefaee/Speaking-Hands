@@ -37,6 +37,7 @@ from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 
 from landmark_utils import TOTAL_FEATURES
+from dataset_utils import load_labels, load_static_csv, check_label_ids
 
 
 def get_args():
@@ -61,25 +62,9 @@ def get_args():
     return parser.parse_args()
 
 
-def load_labels(label_csv_path):
-    with open(label_csv_path, encoding="utf-8-sig") as f:
-        return [row[0] for row in csv.reader(f) if row]
-
-
+# load_labels / load_dataset live in dataset_utils.py (shared loader).
 def load_dataset(data_csv_path, num_features):
-    raw = np.loadtxt(data_csv_path, delimiter=",", dtype="float32")
-    if raw.ndim == 1:
-        raw = raw.reshape(1, -1)
-
-    y = raw[:, 0].astype(int)
-    x = raw[:, 1:]
-
-    if x.shape[1] != num_features:
-        raise ValueError(
-            f"Each row in {data_csv_path} has {x.shape[1]} feature values, "
-            f"but --num_features is {num_features}. These must match."
-        )
-    return x, y
+    return load_static_csv(data_csv_path, num_features)
 
 
 def build_model(num_features, num_classes):
@@ -119,18 +104,8 @@ def main():
     # data that doesn't have a matching row in the label file (or vice
     # versa), instead of letting it surface later as a confusing crash.
     present_ids = set(np.unique(y).tolist())
-    expected_ids = set(range(num_classes))
-    unknown_ids = present_ids - expected_ids
-    if unknown_ids:
-        raise SystemExit(
-            f"Found label id(s) {sorted(unknown_ids)} in {args.data_csv} "
-            f"that have no matching row in {args.label_csv} (which only "
-            f"defines ids 0-{num_classes - 1}). Fix the label file (or "
-            f"re-extract) before training."
-        )
-    missing_ids = expected_ids - present_ids
-    if missing_ids:
-        missing_names = [labels[i] for i in sorted(missing_ids)]
+    missing_names = check_label_ids(y, labels, args.data_csv, args.label_csv)
+    if missing_names:
         print(f"WARNING: these labels have ZERO training samples and will "
               f"never be predicted correctly: {missing_names}")
         print("Collect at least a few dozen samples for each before relying "

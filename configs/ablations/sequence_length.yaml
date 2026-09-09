@@ -1,0 +1,6 @@
+# Shorter windows = lower recognition delay (window_span = length / fps).
+# The stored 30-frame windows are cut with data.resample (tail keeps the end).
+name: seqlen
+grid:
+  data.sequence_length: [10, 20, 30]
+seeds: [1, 42, 123]

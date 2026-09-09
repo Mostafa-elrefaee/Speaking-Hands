@@ -1,0 +1,8 @@
+# gru_lstm on the repo's own sequence dataset. Same data / head / training recipe as
+# the other three (only the temporal encoder differs) -- that is what makes the
+# comparison fair. Everything not listed = configs/default.yaml.
+name: gru_lstm
+model:
+  architecture: gru_lstm
+  gru_num_layers: 1              # GRU stage 1 -> LSTM stage 2 (each 64 units)
+  lstm_num_layers: 1

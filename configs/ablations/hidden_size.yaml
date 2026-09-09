@@ -1,0 +1,4 @@
+name: hidden
+grid:
+  model.hidden_size: [32, 64, 128]
+seeds: [1, 42, 123]

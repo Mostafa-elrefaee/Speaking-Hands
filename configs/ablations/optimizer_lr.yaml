@@ -1,0 +1,5 @@
+name: opt_lr
+grid:
+  training.optimizer: [adam, adamw]
+  training.learning_rate: [0.003, 0.001, 0.0003]
+seeds: [1, 42, 123]

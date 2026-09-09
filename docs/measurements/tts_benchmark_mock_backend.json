@@ -1,0 +1,450 @@
+{
+  "label": "baseline",
+  "metadata": {
+    "timestamp": "2026-09-09T21:52:26",
+    "architecture": "lstm",
+    "model_dir": "",
+    "model_experiment_id": null,
+    "model_configuration": {
+      "architecture": "lstm",
+      "hidden_size": 64,
+      "num_layers": 2,
+      "bidirectional": false,
+      "dropout": 0.2,
+      "recurrent_dropout": 0.0,
+      "pooling": "last",
+      "gru_hidden_size": 0,
+      "lstm_hidden_size": 0,
+      "gru_num_layers": 0,
+      "lstm_num_layers": 0,
+      "mlp_hidden_layers": [
+        128,
+        64
+      ],
+      "dense_layers": [
+        32
+      ],
+      "activation": "relu",
+      "normalization": "none",
+      "head_dropout": 0.0
+    },
+    "param_count": null,
+    "sequence_length": 30,
+    "feature_dim": null,
+    "training_sampling_fps": 30.0,
+    "target_fps": 20.0,
+    "actual_fps": 20.055298990659633,
+    "dataset": {
+      "path": "model/sequence_classifier/sequence_data.csv",
+      "label_path": "model/sequence_classifier/sequence_classifier_label.csv",
+      "id": ""
+    },
+    "seed": 42,
+    "hardware": {
+      "python": "3.12.3",
+      "platform": "Linux-6.18.44-fc-v24-x86_64-with-glibc2.39",
+      "machine": "x86_64",
+      "processor": "x86_64",
+      "cpu_count": 1,
+      "tensorflow": "2.21.0",
+      "mediapipe": "0.10.33",
+      "cv2": "4.13.0",
+      "pyttsx3": "?",
+      "gpus": []
+    },
+    "landmark_configuration": {
+      "extractor": "none (tts benchmark: scripted predictions)",
+      "feature_layout": {
+        "left_hand": [
+          0,
+          42
+        ],
+        "right_hand": [
+          42,
+          84
+        ]
+      },
+      "feature_groups": [],
+      "max_num_hands": 2,
+      "model_complexity": 1,
+      "min_detection_confidence": 0.7,
+      "min_tracking_confidence": 0.5
+    },
+    "confidence_threshold": 0.5,
+    "stability_settings": {
+      "confidence_threshold": 0.5,
+      "stable_count": 8,
+      "averaging_window": 1,
+      "voting_window": 0,
+      "cooldown_s": 0.0,
+      "duplicate_suppression": false,
+      "repeat_after_s": 3.0,
+      "max_missing_frames": 5
+    },
+    "tts_backend": "mock",
+    "tts_configuration": {
+      "enabled": true,
+      "backend": "mock",
+      "rate": 0,
+      "volume": 0.0,
+      "voice": "",
+      "prewarm": true,
+      "prespawn": true,
+      "mode": "immediate_word",
+      "duplicate_cooldown_ms": 0.0,
+      "require_prediction_change": false,
+      "minimum_stable_duration_ms": 0.0,
+      "phrase_max_words": 4,
+      "phrase_timeout_ms": 1500.0,
+      "label_map": {},
+      "unknown_label_policy": "speak_label",
+      "split_label_words": false,
+      "capitalization": "none",
+      "punctuation": false,
+      "queue_size": 2,
+      "overflow_policy": "drop_oldest",
+      "max_pending_age_ms": 1500.0,
+      "interrupt_current_audio": false,
+      "duplicate_window_s": 0.0,
+      "mock_latency_s": 0.05,
+      "mock_init_s": 0.0
+    },
+    "realtime_configuration": {
+      "camera_index": 0,
+      "camera_width": 960,
+      "camera_height": 540,
+      "camera_backend": "auto",
+      "max_num_hands": 2,
+      "use_static_image_mode": false,
+      "min_detection_confidence": 0.7,
+      "min_tracking_confidence": 0.5,
+      "model_complexity": 1,
+      "target_fps": 20.0,
+      "max_catchup_intervals": 2,
+      "max_queue_size": 1,
+      "latest_frame_strategy": true,
+      "drop_stale_frames": true,
+      "stale_frame_max_age_s": 0.25,
+      "max_sequence_gap_intervals": 3.0,
+      "latency_window": 500,
+      "profiling_enabled": true,
+      "debug_overlay_enabled": true,
+      "log_every_s": 0.0,
+      "benchmark": false,
+      "benchmark_dir": "experiments/realtime",
+      "show_window": true
+    }
+  },
+  "stream": {
+    "n_events_requested": 30,
+    "predictions_delivered": 360,
+    "hold_s": 0.4,
+    "gap_s": 0.2,
+    "delivered_fps": 20.055298990659633,
+    "duration_s": 17.950368137999988
+  },
+  "speech_events": {
+    "mode": "immediate_word",
+    "events_created": 30,
+    "suppressed_duplicates": 0,
+    "suppressed_unstable": 0,
+    "suppressed_empty": 0,
+    "duplicate_cooldown_ms": 0.0,
+    "require_prediction_change": false,
+    "minimum_stable_duration_ms": 0.0
+  },
+  "stabilizer": {
+    "events": 30,
+    "suppressed": 0
+  },
+  "tts": {
+    "backend": "mock",
+    "prewarm": true,
+    "prewarm_ms": 0.0975209999865001,
+    "queue_size": 2,
+    "overflow_policy": "drop_oldest",
+    "max_pending_age_ms": 1500.0,
+    "interrupt_current_audio": false,
+    "requested": 30,
+    "spoken": 30,
+    "failed": 0,
+    "suppressed_duplicates": 0,
+    "dropped_overflow": 0,
+    "expired": 0,
+    "interrupts": 0,
+    "errors": [],
+    "t2_t1_validation_ms": {
+      "n": 30,
+      "mean": 0.002921366664547046,
+      "std": 0.0005227149312799069,
+      "min": 0.001534999967134354,
+      "max": 0.003924999987248157,
+      "p50": 0.0029519999884541903,
+      "p95": 0.0036911999870881114
+    },
+    "t3_t2_event_ms": {
+      "n": 30,
+      "mean": 0.20098503333277526,
+      "std": 0.022384150080552428,
+      "min": 0.14642500002537417,
+      "max": 0.2362210000228515,
+      "p50": 0.2046369999959552,
+      "p95": 0.23310464997337021
+    },
+    "t4_t3_queue_wait_ms": {
+      "n": 30,
+      "mean": 0.14721369999316872,
+      "std": 0.027626455449337152,
+      "min": 0.11094999996430488,
+      "max": 0.27566400001433067,
+      "p50": 0.1413745000036215,
+      "p95": 0.1722126500169452
+    },
+    "t5_t4_synthesis_ms": {
+      "n": 30,
+      "mean": 50.12436050000512,
+      "std": 0.032946941047913306,
+      "min": 50.08960599997181,
+      "max": 50.20279900003288,
+      "p50": 50.109613000017816,
+      "p95": 50.19473459996675
+    },
+    "t6_t5_audio_startup_ms": {
+      "n": 30,
+      "mean": 0.0,
+      "std": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "p50": 0.0,
+      "p95": 0.0
+    },
+    "t6_t2_confirmed_to_audio_ms": {
+      "n": 30,
+      "mean": 50.47255923333106,
+      "std": 0.05848667333906458,
+      "min": 50.38006399996675,
+      "max": 50.67438199995422,
+      "p50": 50.4587370000138,
+      "p95": 50.56771585000206
+    },
+    "t1_t0_capture_to_model_ms": {
+      "n": 30,
+      "mean": 50.00000000001137,
+      "std": 0.0,
+      "min": 50.00000000001137,
+      "max": 50.00000000001137,
+      "p50": 50.00000000001137,
+      "p95": 50.00000000001137
+    },
+    "t2_t0_capture_to_stable_ms": {
+      "n": 30,
+      "mean": 50.00292136667591,
+      "std": 0.000522714931279907,
+      "min": 50.0015349999785,
+      "max": 50.00392499999862,
+      "p50": 50.00295199999982,
+      "p95": 50.00369119999846
+    },
+    "t4_t0_capture_to_tts_start_ms": {
+      "n": 30,
+      "mean": 50.35112010000186,
+      "std": 0.0445948486713713,
+      "min": 50.25890999996818,
+      "max": 50.5007360000036,
+      "p50": 50.35141650000696,
+      "p95": 50.409670100017934
+    },
+    "t6_t0_capture_to_audio_ms": {
+      "n": 30,
+      "mean": 100.47548060000697,
+      "std": 0.058774754618569396,
+      "min": 100.38206999996646,
+      "max": 100.67768199996863,
+      "p50": 100.46161900004336,
+      "p95": 100.5713222499935
+    },
+    "playback_ms": {
+      "n": 30,
+      "mean": 0.02571466666267952,
+      "std": 0.010424998729987941,
+      "min": 0.016797999990103563,
+      "max": 0.05567599998812511,
+      "p50": 0.020363499999120904,
+      "p95": 0.04564080000761805
+    },
+    "prediction_to_tts_start_ms": {
+      "n": 30,
+      "mean": 0.348198733325944,
+      "std": 0.044274803079977734,
+      "min": 0.25737499998967905,
+      "max": 0.4974359999891931,
+      "p50": 0.34835499997143415,
+      "p95": 0.40647029999263395
+    },
+    "tts_generation_ms": {
+      "n": 30,
+      "mean": 50.12436050000512,
+      "std": 0.032946941047913306,
+      "min": 50.08960599997181,
+      "max": 50.20279900003288,
+      "p50": 50.109613000017816,
+      "p95": 50.19473459996675
+    },
+    "audio_startup_ms": {
+      "n": 30,
+      "mean": 0.0,
+      "std": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "p50": 0.0,
+      "p95": 0.0
+    },
+    "total_prediction_to_speech_ms": {
+      "n": 30,
+      "mean": 50.47255923333106,
+      "std": 0.05848667333906458,
+      "min": 50.38006399996675,
+      "max": 50.67438199995422,
+      "p50": 50.4587370000138,
+      "p95": 50.56771585000206
+    },
+    "capture_to_speech_ms": {
+      "n": 30,
+      "mean": 100.47548060000697,
+      "std": 0.058774754618569396,
+      "min": 100.38206999996646,
+      "max": 100.67768199996863,
+      "p50": 100.46161900004336,
+      "p95": 100.5713222499935
+    },
+    "queue_wait_ms": {
+      "n": 30,
+      "mean": 0.14721369999316872,
+      "std": 0.027626455449337152,
+      "min": 0.11094999996430488,
+      "max": 0.27566400001433067,
+      "p50": 0.1413745000036215,
+      "p95": 0.1722126500169452
+    }
+  },
+  "stabilization_ms": {
+    "n": 360,
+    "mean": 0.1965144722250203,
+    "std": 0.028741812219792058,
+    "min": 0.10214900004257288,
+    "max": 0.28771900002766415,
+    "p50": 0.19472600001790852,
+    "p95": 0.24818984997807547,
+    "p99": 0.27500966000275195
+  },
+  "latency": {
+    "t2_t1_validation_ms": {
+      "n": 30,
+      "mean": 0.002921366664547046,
+      "std": 0.0005227149312799069,
+      "min": 0.001534999967134354,
+      "max": 0.003924999987248157,
+      "p50": 0.0029519999884541903,
+      "p95": 0.0036911999870881114
+    },
+    "t3_t2_event_ms": {
+      "n": 30,
+      "mean": 0.20098503333277526,
+      "std": 0.022384150080552428,
+      "min": 0.14642500002537417,
+      "max": 0.2362210000228515,
+      "p50": 0.2046369999959552,
+      "p95": 0.23310464997337021
+    },
+    "t4_t3_queue_wait_ms": {
+      "n": 30,
+      "mean": 0.14721369999316872,
+      "std": 0.027626455449337152,
+      "min": 0.11094999996430488,
+      "max": 0.27566400001433067,
+      "p50": 0.1413745000036215,
+      "p95": 0.1722126500169452
+    },
+    "t5_t4_synthesis_ms": {
+      "n": 30,
+      "mean": 50.12436050000512,
+      "std": 0.032946941047913306,
+      "min": 50.08960599997181,
+      "max": 50.20279900003288,
+      "p50": 50.109613000017816,
+      "p95": 50.19473459996675
+    },
+    "t6_t5_audio_startup_ms": {
+      "n": 30,
+      "mean": 0.0,
+      "std": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "p50": 0.0,
+      "p95": 0.0
+    },
+    "t6_t2_confirmed_to_audio_ms": {
+      "n": 30,
+      "mean": 50.47255923333106,
+      "std": 0.05848667333906458,
+      "min": 50.38006399996675,
+      "max": 50.67438199995422,
+      "p50": 50.4587370000138,
+      "p95": 50.56771585000206
+    },
+    "t1_t0_capture_to_model_ms": {
+      "n": 30,
+      "mean": 50.00000000001137,
+      "std": 0.0,
+      "min": 50.00000000001137,
+      "max": 50.00000000001137,
+      "p50": 50.00000000001137,
+      "p95": 50.00000000001137
+    },
+    "t2_t0_capture_to_stable_ms": {
+      "n": 30,
+      "mean": 50.00292136667591,
+      "std": 0.000522714931279907,
+      "min": 50.0015349999785,
+      "max": 50.00392499999862,
+      "p50": 50.00295199999982,
+      "p95": 50.00369119999846
+    },
+    "t4_t0_capture_to_tts_start_ms": {
+      "n": 30,
+      "mean": 50.35112010000186,
+      "std": 0.0445948486713713,
+      "min": 50.25890999996818,
+      "max": 50.5007360000036,
+      "p50": 50.35141650000696,
+      "p95": 50.409670100017934
+    },
+    "t6_t0_capture_to_audio_ms": {
+      "n": 30,
+      "mean": 100.47548060000697,
+      "std": 0.058774754618569396,
+      "min": 100.38206999996646,
+      "max": 100.67768199996863,
+      "p50": 100.46161900004336,
+      "p95": 100.5713222499935
+    },
+    "playback_ms": {
+      "n": 30,
+      "mean": 0.02571466666267952,
+      "std": 0.010424998729987941,
+      "min": 0.016797999990103563,
+      "max": 0.05567599998812511,
+      "p50": 0.020363499999120904,
+      "p95": 0.04564080000761805
+    }
+  },
+  "primary_metric_confirmed_to_audio_ms": {
+    "n": 30,
+    "mean": 50.47255923333106,
+    "std": 0.05848667333906458,
+    "min": 50.38006399996675,
+    "max": 50.67438199995422,
+    "p50": 50.4587370000138,
+    "p95": 50.56771585000206
+  }
+}

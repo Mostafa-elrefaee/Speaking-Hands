@@ -21,104 +21,182 @@ gesture -- it was also unrelated to sign-language recognition to begin
 with.
 
 Motion signs: a rolling deque of combined vectors feeds the optional
-SequenceClassifier every frame alongside the static KeyPointClassifier
-(sequence wins when confident, static is the fallback). The result is
-debounced by gesture_output.GestureStabilizer and that ONE stabilized value
-is both drawn on screen and spoken via pyttsx3 on a background thread.
+SequenceClassifier alongside the static KeyPointClassifier (sequence wins
+when confident, static is the fallback). The result is debounced by
+gesture_output.PredictionStabilizer (GestureStabilizer + optional smoothing)
+and that ONE stabilized value is both drawn on screen and spoken via pyttsx3
+on a background thread.
+
+Research/realtime integration (sh_research):
+  * Frames come from sh_research.realtime.FrameSource: a capture thread +
+    latest-frame buffer + timestamp scheduler at --target_fps (default 20 =
+    one processed frame per 50 ms, independent of the camera's own rate).
+    --target_fps 0 restores the original every-frame synchronous loop.
+  * Per-frame processing lives in sh_research.realtime.GesturePipeline (the
+    same code the headless benchmark runs) and every stage is timed.
+  * Speech goes prediction -> stable event -> SpeechEventManager ->
+    bounded TTS queue -> background worker; the loop never waits for audio.
+  * --config / --set expose every parameter (configs/*.yaml); the classic
+    flags below still work and take precedence.
+
+Keys: ESC quit, k + 0-9 log a static sample, p toggle the profiling overlay.
 """
 import os
 import csv
-import copy
 import argparse
-from collections import deque
+import json
+import time
+from pathlib import Path
 
 import cv2 as cv
 import mediapipe as mp
 
-from utils import CvFpsCalc
 from model import KeyPointClassifier
-from landmark_utils import build_combined_vector, TOTAL_FEATURES
-from gesture_output import (choose_gesture, GestureStabilizer, SpeechWorker)
+from landmark_utils import TOTAL_FEATURES
+from gesture_output import (choose_gesture, GestureStabilizer, PredictionStabilizer,  # noqa: F401
+                            SpeechWorker)
 from camera_utils import open_camera
+from dataset_utils import load_labels
+from sh_research.config import (ExperimentConfig, SEQ_LABEL_CSV, SEQ_MODEL_TFLITE, apply_overrides,
+                                load_config)
+from sh_research.data.dataset import Preprocessor
+from sh_research.realtime import FrameSource, GesturePipeline, HandsExtractor, PerfTracker
+from sh_research.realtime.overlay import draw_overlay
+from sh_research.tts.events import SpeechEventManager
 
-# How many consecutive frames a raw prediction must agree before it becomes
-# the "current gesture" that is drawn AND spoken. At ~30 fps, 8 frames is
-# ~0.27 s: long enough to swallow 1-3 frame classifier flicker and most of the
-# static/sequence disagreement at the onset of a motion sign, short enough
-# that a fluent signer holding each word for ~0.4 s+ still gets every word.
+# Kept as module constants for readers of the old code; the live values come
+# from the config (stabilizer.stable_count / stabilizer.max_missing_frames).
 STABLE_FRAMES = 8
-
-# Consecutive no-hand frames after which the sequence buffer is reset.
-# Shorter dropouts keep the buffer as-is (training data skips no-hand frames
-# too, see extract_gesture_data.py), longer gaps mean a new sign is starting
-# and stale pre-gap frames would only mislead the sequence model.
 MAX_MISSING_FRAMES = 5
 
-SEQ_MODEL_PATH = 'model/sequence_classifier/sequence_classifier.tflite'
-SEQ_LABEL_PATH = 'model/sequence_classifier/sequence_classifier_label.csv'
+SEQ_MODEL_PATH = SEQ_MODEL_TFLITE
+SEQ_LABEL_PATH = SEQ_LABEL_CSV
 
 
 def get_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--width", help='cap width', type=int, default=960)
-    parser.add_argument("--height", help='cap height', type=int, default=540)
+    parser.add_argument("--device", type=int, default=None)
+    parser.add_argument("--width", help='cap width', type=int, default=None)
+    parser.add_argument("--height", help='cap height', type=int, default=None)
 
     parser.add_argument('--use_static_image_mode', action='store_true')
-    parser.add_argument("--max_num_hands", type=int, default=2)
+    parser.add_argument("--max_num_hands", type=int, default=None)
     parser.add_argument("--min_detection_confidence",
                         help='min_detection_confidence',
                         type=float,
-                        default=0.7)
+                        default=None)
     parser.add_argument("--min_tracking_confidence",
                         help='min_tracking_confidence',
                         type=float,
-                        default=0.5)
+                        default=None)
 
-    parser.add_argument("--seq_model", type=str, default=SEQ_MODEL_PATH)
+    parser.add_argument("--seq_model", type=str, default=SEQ_MODEL_PATH,
+                        help='sequence .tflite, or a research run directory '
+                             '(experiments/<run>) holding model.tflite + labels.csv')
     parser.add_argument("--seq_label", type=str, default=SEQ_LABEL_PATH)
-    parser.add_argument("--seq_score_th", type=float, default=0.5,
-                        help='sequence classifier confidence threshold')
-    parser.add_argument("--stable_frames", type=int, default=STABLE_FRAMES)
+    parser.add_argument("--seq_score_th", type=float, default=None,
+                        help='sequence classifier confidence threshold '
+                             '(config: stabilizer.confidence_threshold, default 0.5)')
+    parser.add_argument("--stable_frames", type=int, default=None,
+                        help='consecutive frames before a gesture is shown/spoken '
+                             '(config: stabilizer.stable_count, default 8)')
     parser.add_argument("--no_tts", action='store_true',
                         help='disable spoken output')
     parser.add_argument("--backend", choices=["auto", "dshow", "msmf", "any"],
-                        default="auto",
+                        default=None,
                         help='camera backend (auto = dshow, then msmf on Windows)')
+
+    # --- research / realtime additions ---
+    parser.add_argument("--config", type=str, default=None,
+                        help='YAML config (configs/realtime.yaml); defaults = original behaviour')
+    parser.add_argument("--set", dest="overrides", action="append", default=[],
+                        metavar="KEY=VALUE",
+                        help='override any config key, e.g. --set realtime.target_fps=15 '
+                             '(repeatable)')
+    parser.add_argument("--target_fps", type=float, default=None,
+                        help='ML processing rate (default 20; 0 = process every camera frame '
+                             'synchronously, the original behaviour)')
+    parser.add_argument("--tts_backend", choices=["pyttsx3_subprocess", "pyttsx3", "print", "mock"],
+                        default=None)
+    parser.add_argument("--no_overlay", action='store_true',
+                        help='hide the profiling overlay (p key toggles it)')
+    parser.add_argument("--no_profiling", action='store_true',
+                        help='disable per-stage timing')
+    parser.add_argument("--benchmark", action='store_true',
+                        help='write realtime_benchmark.json (+ speech-event CSV) on exit')
+    parser.add_argument("--benchmark_dir", type=str, default=None)
+    parser.add_argument("--duration", type=float, default=None,
+                        help='stop after this many seconds (benchmarks)')
 
     args = parser.parse_args()
 
     return args
 
 
+def build_config(args):
+    """defaults <- --config YAML <- --set overrides <- explicit classic flags."""
+    cfg = load_config(args.config) if args.config else ExperimentConfig()
+    cfg = apply_overrides(cfg, args.overrides)
+    rt, st, tts = cfg.realtime, cfg.stabilizer, cfg.tts
+    if args.device is not None:
+        rt.camera_index = args.device
+    if args.width is not None:
+        rt.camera_width = args.width
+    if args.height is not None:
+        rt.camera_height = args.height
+    if args.backend is not None:
+        rt.camera_backend = args.backend
+    if args.use_static_image_mode:
+        rt.use_static_image_mode = True
+    if args.max_num_hands is not None:
+        rt.max_num_hands = args.max_num_hands
+    if args.min_detection_confidence is not None:
+        rt.min_detection_confidence = args.min_detection_confidence
+    if args.min_tracking_confidence is not None:
+        rt.min_tracking_confidence = args.min_tracking_confidence
+    if args.seq_score_th is not None:
+        st.confidence_threshold = args.seq_score_th
+    if args.stable_frames is not None:
+        st.stable_count = args.stable_frames
+    if args.target_fps is not None:
+        rt.target_fps = args.target_fps
+    if args.no_tts:
+        tts.enabled = False
+    if args.tts_backend is not None:
+        tts.backend = args.tts_backend
+    if args.no_overlay:
+        rt.debug_overlay_enabled = False
+    if args.no_profiling:
+        rt.profiling_enabled = False
+    if args.benchmark:
+        rt.benchmark = True
+    if args.benchmark_dir is not None:
+        rt.benchmark_dir = args.benchmark_dir
+    return cfg
+
+
 def main():
     # Argument parsing #################################################################
     args = get_args()
-
-    cap_device = args.device
-    cap_width = args.width
-    cap_height = args.height
-
-    use_static_image_mode = args.use_static_image_mode
-    max_num_hands = args.max_num_hands
-    min_detection_confidence = args.min_detection_confidence
-    min_tracking_confidence = args.min_tracking_confidence
+    cfg = build_config(args)
+    rt = cfg.realtime
 
     use_brect = True
 
     # Camera preparation ###############################################################
     # open_camera() picks a backend that actually delivers a real image
     # (see camera_utils.py) instead of trusting cv.VideoCapture(0).
-    cap, _backend = open_camera(cap_device, args.backend, cap_width, cap_height)
+    cap, _backend = open_camera(rt.camera_index, rt.camera_backend, rt.camera_width, rt.camera_height)
 
     # Model load #############################################################
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
-        static_image_mode=use_static_image_mode,
-        max_num_hands=max_num_hands,
-        min_detection_confidence=min_detection_confidence,
-        min_tracking_confidence=min_tracking_confidence,
+        static_image_mode=rt.use_static_image_mode,
+        max_num_hands=rt.max_num_hands,
+        model_complexity=rt.model_complexity,
+        min_detection_confidence=rt.min_detection_confidence,
+        min_tracking_confidence=rt.min_tracking_confidence,
     )
 
     keypoint_classifier = KeyPointClassifier()
@@ -132,29 +210,57 @@ def main():
         ]
 
     # Sequence (motion) classifier -- optional, degrades to static-only ######
+    seq_model_path, seq_label_path, preprocessor = resolve_sequence_model(args.seq_model, args.seq_label)
     sequence_classifier, sequence_classifier_labels = load_sequence_classifier(
-        args.seq_model, args.seq_label, args.seq_score_th)
-    seq_len = sequence_classifier.seq_length if sequence_classifier else 1
-    seq_buffer = deque(maxlen=int(seq_len))
+        seq_model_path, seq_label_path, cfg.stabilizer.confidence_threshold)
+    if sequence_classifier is None:
+        preprocessor = None
 
-    # Stabilizer + TTS: ONE stabilized "current gesture" feeds both ##########
-    stabilizer = GestureStabilizer(args.stable_frames)
+    # Stabilizer + speech: ONE stabilized "current gesture" feeds both ##########
+    stabilizer = PredictionStabilizer(cfg.stabilizer, sequence_classifier_labels or keypoint_classifier_labels)
+    speech_events = SpeechEventManager(cfg.tts)
     speaker = None
-    if not args.no_tts:
-        speaker = SpeechWorker().start()  # raises with an actionable message
+    if cfg.tts.enabled:
+        speaker = SpeechWorker(cfg=cfg.tts).start()  # raises with an actionable message
 
-    # FPS Measurement ########################################################
-    cvFpsCalc = CvFpsCalc(buffer_len=10)
+    perf = PerfTracker(rt.latency_window, rt.target_fps, rt.profiling_enabled)
+    pipeline = GesturePipeline(cfg, HandsExtractor(hands), keypoint_classifier, keypoint_classifier_labels,
+                               sequence_classifier, sequence_classifier_labels, stabilizer, speech_events,
+                               speaker, preprocessor, perf)
+    source = FrameSource(rt, perf, cap=cap)
 
+    report = None
     try:
-        run_loop(cap, hands, keypoint_classifier, keypoint_classifier_labels,
-                 sequence_classifier, sequence_classifier_labels, seq_buffer,
-                 stabilizer, speaker, cvFpsCalc, use_brect)
+        run_loop(source, pipeline, cfg, use_brect, duration=args.duration)
     finally:
+        source.close()
         cap.release()
         cv.destroyAllWindows()
+        report = pipeline.report()
         if speaker is not None:
             speaker.close()
+        pipeline.close()
+        if rt.benchmark:
+            write_benchmark(cfg, pipeline, report, seq_model_path)
+    return report
+
+
+def resolve_sequence_model(seq_model, seq_label):
+    """--seq_model may be a .tflite (original) or a research run directory
+    (experiments/<run>/ with model.tflite, labels.csv, metadata.json). A run
+    directory also brings its preprocessor (feature selection / normalisation
+    used in training) so inference matches training exactly."""
+    p = Path(seq_model)
+    if p.is_dir():
+        meta_path = p / "metadata.json"
+        pre = None
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if "preprocessor" in meta:
+                pre = Preprocessor.from_dict(meta["preprocessor"])
+        labels = p / "labels.csv"
+        return str(p / "model.tflite"), (str(labels) if labels.exists() else seq_label), pre
+    return seq_model, seq_label, None
 
 
 def load_sequence_classifier(model_path, label_path, score_th):
@@ -169,8 +275,7 @@ def load_sequence_classifier(model_path, label_path, score_th):
 
     from model.sequence_classifier.sequence_classifier import SequenceClassifier
     clf = SequenceClassifier(model_path=model_path, score_th=score_th)
-    with open(label_path, encoding='utf-8-sig') as f:
-        labels = [row[0] for row in csv.reader(f) if row]
+    labels = load_labels(label_path)
 
     # Same guard rails as the training scripts: never trust hand-typed sizes.
     num_classes = int(clf.output_details[0]['shape'][-1])
@@ -198,90 +303,136 @@ def load_sequence_classifier(model_path, label_path, score_th):
     return clf, labels
 
 
-def run_loop(cap, hands, keypoint_classifier, keypoint_classifier_labels,
-             sequence_classifier, sequence_classifier_labels, seq_buffer,
-             stabilizer, speaker, cvFpsCalc, use_brect):
+def run_loop(source, pipeline, cfg, use_brect, duration=None):
+    rt = cfg.realtime
     mode = 0
-    missing_frames = 0
+    number = -1
+    overlay = rt.debug_overlay_enabled
+    # The original loop waited 10 ms in waitKey every frame; with the
+    # scheduler the wait happens inside FrameSource.next() instead.
+    key_wait = 10 if rt.target_fps <= 0 else 1
+    start = time.monotonic()
+    last_log = start
 
+    source.start()
     while True:
-        fps = cvFpsCalc.get()
+        if duration is not None and time.monotonic() - start >= duration:
+            break
 
         # Process Key (ESC: end) #################################################
-        key = cv.waitKey(10)
+        key = cv.waitKey(key_wait)
         if key == 27:  # ESC
             break
+        if key == 112:  # p: toggle profiling overlay
+            overlay = not overlay
         number, mode = select_mode(key, mode)
 
-        # Camera capture #####################################################
-        ret, image = cap.read()
-        if not ret:
-            break
-        image = cv.flip(image, 1)  # Mirror display
-        debug_image = copy.deepcopy(image)
+        # Camera capture / scheduling ################################################
+        item = source.next()
+        if item is None:
+            if source.ended:
+                break
+            continue
 
-        # Detection implementation #############################################################
-        image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
+        # Detection + classification + stabilisation + speech event ###################
+        result = pipeline.process(item.frame, item.captured_at, item.late_s, item.acquire_ms)
+        debug_image = result.image
 
-        image.flags.writeable = False
-        results = hands.process(image)
-        image.flags.writeable = True
-
-        #  ####################################################################
-        # Combine whatever hand(s) were detected this frame into ONE gesture
-        # vector -- the exact same function used to build training data.
-        combined_vector, per_hand_info = build_combined_vector(
-            debug_image, results.multi_hand_landmarks, results.multi_handedness)
-
-        raw_gesture, source = None, None
-        if per_hand_info:  # at least one hand detected
-            missing_frames = 0
+        if result.per_hand_info:
             # Write to the dataset file (data-collection mode, 'k' key)
-            logging_csv(number, mode, combined_vector)
+            logging_csv(number, mode, result.combined_vector)
 
-            # Rolling window for the motion model. Only hand-present frames
-            # are appended -- identical to how extract_gesture_data.py builds
-            # the training windows. A missing SECOND hand is already
-            # zero-filled inside combined_vector.
-            seq_buffer.append(combined_vector)
+        # Drawing ########################################################################
+        t_draw = time.monotonic()
+        for side, landmark_list, brect in result.per_hand_info:
+            debug_image = draw_bounding_rect(use_brect, debug_image, brect)
+            debug_image = draw_landmarks(debug_image, landmark_list)
+            debug_image = draw_hand_tag(debug_image, brect, side)
 
-            # ONE static prediction for the whole (one- or two-handed) gesture
-            hand_sign_id = keypoint_classifier(combined_vector)
-            static_label = keypoint_classifier_labels[hand_sign_id]
-
-            # Sequence prediction (wrapper returns invalid_value until the
-            # buffer holds seq_length frames or when confidence is low)
-            seq_label = None
-            if sequence_classifier is not None:
-                seq_id = sequence_classifier(seq_buffer)
-                if seq_id != sequence_classifier.invalid_value:
-                    seq_label = sequence_classifier_labels[seq_id]
-
-            raw_gesture, source = choose_gesture(seq_label, static_label)
-
-            # Drawing: each hand's skeleton + box
-            for side, landmark_list, brect in per_hand_info:
-                debug_image = draw_bounding_rect(use_brect, debug_image, brect)
-                debug_image = draw_landmarks(debug_image, landmark_list)
-                debug_image = draw_hand_tag(debug_image, brect, side)
-        else:
-            missing_frames += 1
-            if missing_frames == MAX_MISSING_FRAMES:
-                seq_buffer.clear()
-
-        # Single source of truth: the stabilized gesture drives BOTH the
-        # on-screen label and the speech output. `changed` fires exactly once
-        # per stabilization to a new value.
-        current_gesture, changed = stabilizer.update(raw_gesture)
-        if changed and current_gesture is not None and speaker is not None:
-            speaker.say(current_gesture)
-
-        debug_image = draw_gesture_text(debug_image, current_gesture)
-        debug_image = draw_raw_gesture(debug_image, raw_gesture, source)
-        debug_image = draw_info(debug_image, fps, mode, number)
+        debug_image = draw_gesture_text(debug_image, result.current)
+        debug_image = draw_raw_gesture(debug_image, result.raw_gesture, result.source)
+        debug_image = draw_info(debug_image, pipeline.perf, mode, number)
+        if overlay:
+            draw_overlay(debug_image, pipeline.perf, origin=(10, 160), line_h=18)
 
         # Screen reflection #############################################################
-        cv.imshow('Hand Gesture Recognition', debug_image)
+        if rt.show_window:
+            cv.imshow('Hand Gesture Recognition', debug_image)
+        pipeline.perf.record_draw((time.monotonic() - t_draw) * 1e3)
+
+        if rt.log_every_s and time.monotonic() - last_log >= rt.log_every_s:
+            print(pipeline.perf.one_line(), flush=True)
+            last_log = time.monotonic()
+
+
+def write_benchmark(cfg, pipeline, report, model_path):
+    """realtime_benchmark.json + realtime_speech_events.csv with paper-ready metadata."""
+    from sh_research.experiments.metadata import benchmark_metadata
+    out_dir = Path(cfg.realtime.benchmark_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    meta = {}
+    meta_path = Path(model_path).parent / "metadata.json"
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    report["metadata"] = benchmark_metadata(
+        cfg, meta, actual_fps=report["perf"]["processing_fps_overall"],
+        extractor=getattr(pipeline.extractor, "name", type(pipeline.extractor).__name__),
+        model_dir=str(Path(model_path).parent))
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = out_dir / f"{stamp}_realtime_benchmark.json"
+    path.write_text(json.dumps(report, indent=2, default=float, ensure_ascii=False), encoding="utf-8")
+    report["benchmark_path"] = str(path)
+    speaker = pipeline.speaker
+    if speaker is not None and getattr(speaker, "records", None):
+        rows = speaker.records_as_rows()
+        csv_path = path.with_name(f"{stamp}_realtime_speech_events.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+        report["events_csv_path"] = str(csv_path)
+    print(f"[benchmark] -> {path}")
+    print_report(report)
+    return path
+
+
+def print_report(report):
+    perf, v = report["perf"], report["perf"]["sustainability"]
+    print("\n=== realtime report ===")
+    print(f"target {report['target_fps']:.0f} FPS -> achieved processing {perf['processing_fps_overall']:.2f} FPS "
+          f"| camera {perf['camera_fps_overall']:.2f} FPS | captured {perf['frames_captured']} processed "
+          f"{perf['frames_processed']} dropped {perf['dropped_frames']} stale-skipped {perf['skipped_stale_frames']} "
+          f"| window resets {perf['window_resets']} | events {report['events_emitted']}")
+    if v.get("sustained") is None:
+        print(f"sustained: n/a -- {v.get('reason')}")
+    else:
+        print(f"sustained {v['target_fps']:.0f} FPS: {'YES' if v['sustained'] else 'NO'}"
+              + (f" -- {v['reason']}" if not v["sustained"] else "") + f"  (achieved {v['achieved_ratio']:.0%} of target)")
+    tmp = report.get("temporal") or {}
+    if tmp.get("window_span_realtime_s"):
+        print(f"window: {tmp.get('sequence_length')} frames @ {tmp.get('target_fps')} FPS = "
+              f"{tmp.get('window_span_realtime_s', 0):.2f} s realtime vs {tmp.get('window_span_training_s') or 0:.2f} s in training"
+              + ("  ** MISMATCH **" if tmp.get("mismatch") else ""))
+    print(f"{'stage':22s} {'mean':>8s} {'p50':>8s} {'p95':>8s} {'p99':>8s} {'max':>8s}   n")
+    for k in ("capture_ms", "acquire_ms", "frame_age_ms", "schedule_late_ms", "image_preprocess_ms", "landmark_ms",
+              "feature_ms", "window_ms", "static_model_ms", "sequence_model_ms", "model_ms", "probability_ms",
+              "stabilize_ms", "tts_event_ms", "total_ms", "draw_ms", "loop_ms", "end_to_end_ms",
+              "processing_interval_ms"):
+        d = perf.get(k)
+        if d and d.get("n"):
+            f = lambda x: f"{x:8.2f}" if x is not None else "       -"
+            print(f"{k:22s} {f(d['mean'])} {f(d['p50'])} {f(d.get('p95'))} {f(d.get('p99'))} {f(d['max'])}   {d['n']}")
+    bn = perf.get("bottleneck")
+    if bn:
+        print(f"largest bottleneck: {bn['stage']} (p50 {bn['p50_ms']:.2f} ms, {bn['share_of_total']:.0%} of the loop)")
+    if "tts" in report:
+        t = report["tts"]
+        f = lambda d, k="p50": f"{d[k]:.1f}" if d.get("n") and k in d else "-"
+        print(f"TTS ({t['backend']}): spoken {t['spoken']}, dropped {t['dropped_overflow']}, expired {t['expired']}, "
+              f"failed {t['failed']} | prewarm {t['prewarm_ms'] if t['prewarm_ms'] is not None else '-'} ms | "
+              f"confirmed->tts-start p50 {f(t['prediction_to_tts_start_ms'])} | generation p50 {f(t['tts_generation_ms'])} | "
+              f"confirmed->audio p50 {f(t['total_prediction_to_speech_ms'])} p95 {f(t['total_prediction_to_speech_ms'], 'p95')} | "
+              f"capture->audio p50 {f(t['capture_to_speech_ms'])} ms")
 
 
 def select_mode(key, mode):
@@ -457,10 +608,13 @@ def draw_raw_gesture(image, raw_gesture, source):
     return image
 
 
-def draw_info(image, fps, mode, number):
-    cv.putText(image, "FPS:" + str(fps), (10, 30), cv.FONT_HERSHEY_SIMPLEX,
+def draw_info(image, perf, mode, number):
+    """Top-left FPS line: MEASURED processing rate (frames the pipeline
+    actually processed per second) and camera rate, from PerfTracker."""
+    fps = f"FPS:{perf.processing.fps:.1f} (cam {perf.camera.fps:.1f})"
+    cv.putText(image, fps, (10, 30), cv.FONT_HERSHEY_SIMPLEX,
                1.0, (0, 0, 0), 4, cv.LINE_AA)
-    cv.putText(image, "FPS:" + str(fps), (10, 30), cv.FONT_HERSHEY_SIMPLEX,
+    cv.putText(image, fps, (10, 30), cv.FONT_HERSHEY_SIMPLEX,
                1.0, (255, 255, 255), 2, cv.LINE_AA)
 
     if mode == 1:

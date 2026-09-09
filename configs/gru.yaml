@@ -1,0 +1,6 @@
+# gru on the repo's own sequence dataset. Same data / head / training recipe as
+# the other three (only the temporal encoder differs) -- that is what makes the
+# comparison fair. Everything not listed = configs/default.yaml.
+name: gru
+model:
+  architecture: gru

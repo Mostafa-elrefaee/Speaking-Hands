@@ -1,0 +1,5 @@
+name: reg
+grid:
+  model.dropout: [0.0, 0.2, 0.4]
+  model.normalization: [none, layer]
+seeds: [1, 42, 123]

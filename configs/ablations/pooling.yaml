@@ -1,0 +1,4 @@
+name: pooling
+grid:
+  model.pooling: [last, mean, mean_max]
+seeds: [1, 42, 123]

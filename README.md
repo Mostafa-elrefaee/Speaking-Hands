@@ -1,161 +1,300 @@
-# hand-gesture-recognition-using-mediapipe
-Estimate hand pose using MediaPipe (Python version).<br> This is a sample 
-program that recognizes hand signs and finger gestures with a simple MLP using the detected key points.
-<br> ❗ _️**This is English Translated version of the [original repo](https://github.com/Kazuhito00/hand-gesture-recognition-using-mediapipe). All Content is translated to english along with comments and notebooks**_ ❗
-<br> 
-![mqlrf-s6x16](https://user-images.githubusercontent.com/37477845/102222442-c452cd00-3f26-11eb-93ec-c387c98231be.gif)
+# Speaking Hands — real-time sign-language recognition (hands → text → speech)
 
-This repository contains the following contents.
-* Sample program
-* Hand sign recognition model(TFLite)
-* Finger gesture recognition model(TFLite)
-* Learning data for hand sign recognition and notebook for learning
-* Learning data for finger gesture recognition and notebook for learning
+Smart-glasses AI pipeline: a camera watches the user's hands, MediaPipe Hands
+turns each frame into landmarks, both hands are combined into **one 84-value
+vector**, a static classifier (hand shape) and a sequence classifier (motion
+over 30 frames) predict the sign, the prediction is stabilised, shown on
+screen and **spoken** through pyttsx3.
 
-# Requirements
-* mediapipe 0.8.1
-* OpenCV 3.4.2 or Later
-* Tensorflow 2.3.0 or Later<br>tf-nightly 2.5.0.dev or later (Only when creating a TFLite for an LSTM model)
-* scikit-learn 0.23.2 or Later (Only if you want to display the confusion matrix) 
-* matplotlib 3.3.2 or Later (Only if you want to display the confusion matrix)
-* pyttsx3 (offline text-to-speech; on Linux also install `espeak-ng`, e.g. `sudo apt install espeak-ng`)
+This repository is the original Speaking Hands project (derived from
+Kazuhito Takahashi's hand-gesture-recognition-using-mediapipe, see
+[Credits](#credits-and-license)) **plus an integrated research layer**
+(`sh_research/`, `configs/`, `scripts/`) that adds four interchangeable
+sequence architectures, reproducible experiments, a fixed-rate (20 FPS)
+real-time scheduler with per-stage latency profiling, and an asynchronous
+TTS path with end-to-end (prediction → speech) latency measurement.
+Everything that worked before still works, with the same commands.
 
-# Text-to-speech
-When a gesture is predicted for `--tts_stable_frames` consecutive frames it is spoken
-aloud once (offline, via pyttsx3, on a background thread so the video never stalls).
-The same word is not repeated until a *different* gesture stabilizes. The last spoken
-word is shown top-right as `Spoken: ...`. Logic lives in `tts_speaker.py`;
-tests in `tests/` (`python -m pytest tests/ -v`, no webcam needed).
+---
 
-# Demo
-Here's how to run the demo using your webcam.
+## 1. Quick start
+
 ```bash
+pip install -r requirements.txt
+
+# run live (webcam), 20 FPS processing, spoken output
 python app.py
+
+# original behaviour (process every camera frame, no scheduler)
+python app.py --target_fps 0
+
+# without speech / without the profiling overlay
+python app.py --no_tts --no_overlay
+
+# end a session with a measured report + JSON (experiments/realtime/)
+python app.py --benchmark --duration 60
 ```
 
-The following options can be specified when running the demo.
-* --device<br>Specifying the camera device number (Default：0)
-* --width<br>Width at the time of camera capture (Default：960)
-* --height<br>Height at the time of camera capture (Default：540)
-* --use_static_image_mode<br>Whether to use static_image_mode option for MediaPipe inference (Default：Unspecified)
-* --min_detection_confidence<br>
-Detection confidence threshold (Default：0.5)
-* --no_tts<br>Disable spoken output; on-screen text only (Default：TTS on)
-* --tts_stable_frames<br>How many consecutive identical predictions are needed before a gesture is spoken (Default：10)
-* --tts_rate<br>Speech rate in words per minute (Default：pyttsx3's default)
-* --min_tracking_confidence<br>
-Tracking confidence threshold (Default：0.5)
+Keys inside the window: `ESC` quit · `k` then `0-9` log a static sample to
+`model/keypoint_classifier/keypoint.csv` · `p` toggle the profiling overlay.
 
-# Directory
-<pre>
-│  app.py
-│  keypoint_classification.ipynb
-│  point_history_classification.ipynb
-│  
-├─model
-│  ├─keypoint_classifier
-│  │  │  keypoint.csv
-│  │  │  keypoint_classifier.hdf5
-│  │  │  keypoint_classifier.py
-│  │  │  keypoint_classifier.tflite
-│  │  └─ keypoint_classifier_label.csv
-│  │          
-│  └─point_history_classifier
-│      │  point_history.csv
-│      │  point_history_classifier.hdf5
-│      │  point_history_classifier.py
-│      │  point_history_classifier.tflite
-│      └─ point_history_classifier_label.csv
-│          
-└─utils
-    └─cvfpscalc.py
-</pre>
-### app.py
-This is a sample program for inference.<br>
-In addition, learning data (key points) for hand sign recognition,<br>
-You can also collect training data (index finger coordinate history) for finger gesture recognition.
+`python -m pytest tests/` runs the full test suite (no camera or audio needed).
 
-### keypoint_classification.ipynb
-This is a model training script for hand sign recognition.
+---
 
-### point_history_classification.ipynb
-This is a model training script for finger gesture recognition.
+## 2. Pipeline
 
-### model/keypoint_classifier
-This directory stores files related to hand sign recognition.<br>
-The following files are stored.
-* Training data(keypoint.csv)
-* Trained model(keypoint_classifier.tflite)
-* Label data(keypoint_classifier_label.csv)
-* Inference module(keypoint_classifier.py)
+```
+camera ─▶ capture thread ─▶ latest-frame buffer ─▶ 20 FPS scheduler ─┐   (sh_research.realtime.FrameSource)
+                                                                    ▼
+   flip + BGR→RGB ─▶ MediaPipe Hands (≤2 hands) ─▶ landmark_utils.build_combined_vector  → 84 values
+                                                                    ▼
+      rolling window (30 hand-present frames) ─▶ SequenceClassifier (TFLite, softmax)   ┐
+      current frame                          ─▶ KeyPointClassifier (TFLite, argmax)     ┤ gesture_output.choose_gesture
+                                                                                        ▼ (sequence wins if confident)
+                 gesture_output.PredictionStabilizer (confidence gate + N-frame debounce) → ONE "current gesture"
+                                                          │                                  (drawn on screen)
+                                                          ▼
+      SpeechEventManager (duplicate policy, label→text) ─▶ bounded queue ─▶ TTS worker thread ─▶ pyttsx3 subprocess
+```
 
-### model/point_history_classifier
-This directory stores files related to finger gesture recognition.<br>
-The following files are stored.
-* Training data(point_history.csv)
-* Trained model(point_history_classifier.tflite)
-* Label data(point_history_classifier_label.csv)
-* Inference module(point_history_classifier.py)
+* `landmark_utils.py` is the single source of truth for the feature vector:
+  `[left hand 42 | right hand 42]`, wrist-relative, max-abs scaled, a missing
+  hand is zero-filled. Training data and live inference use the same function.
+* `dataset_utils.py` is the single loader for the CSV datasets
+  (`keypoint.csv`, `sequence_data.csv`, label files) used by both training
+  scripts and the research package.
+* `gesture_output.py`: `GestureStabilizer` (the original N-consecutive-frames
+  debounce), `PredictionStabilizer` (adds optional probability smoothing /
+  majority vote / confidence gate / cooldown around it) and `SpeechWorker`
+  (compatibility API over `sh_research.tts.TTSWorker`).
+* Models are decoupled from time: any TFLite model with input `[1, T, 84]` and
+  a softmax output is loadable by `model/sequence_classifier/sequence_classifier.py`,
+  whichever of the four research architectures produced it.
 
-### utils/cvfpscalc.py
-This is a module for FPS measurement.
+---
 
-# Training
-Hand sign recognition and finger gesture recognition can add and change training data and retrain the model.
+## 3. Data collection and training (original workflow, unchanged commands)
 
-### Hand sign recognition training
-#### 1.Learning data collection
-Press "k" to enter the mode to save key points（displayed as 「MODE:Logging Key Point」）<br>
-<img src="https://user-images.githubusercontent.com/37477845/102235423-aa6cb680-3f35-11eb-8ebd-5d823e211447.jpg" width="60%"><br><br>
-If you press "0" to "9", the key points will be added to "model/keypoint_classifier/keypoint.csv" as shown below.<br>
-1st column: Pressed number (used as class ID), 2nd and subsequent columns: Key point coordinates<br>
-<img src="https://user-images.githubusercontent.com/37477845/102345725-28d26280-3fe1-11eb-9eeb-8c938e3f625b.png" width="80%"><br><br>
-The key point coordinates are the ones that have undergone the following preprocessing up to ④.<br>
-<img src="https://user-images.githubusercontent.com/37477845/102242918-ed328c80-3f3d-11eb-907c-61ba05678d54.png" width="80%">
-<img src="https://user-images.githubusercontent.com/37477845/102244114-418a3c00-3f3f-11eb-8eef-f658e5aa2d0d.png" width="80%"><br><br>
-In the initial state, three types of learning data are included: open hand (class ID: 0), close hand (class ID: 1), and pointing (class ID: 2).<br>
-If necessary, add 3 or later, or delete the existing data of csv to prepare the training data.<br>
-<img src="https://user-images.githubusercontent.com/37477845/102348846-d0519400-3fe5-11eb-8789-2e7daec65751.jpg" width="25%">　<img src="https://user-images.githubusercontent.com/37477845/102348855-d2b3ee00-3fe5-11eb-9c6d-b8924092a6d8.jpg" width="25%">　<img src="https://user-images.githubusercontent.com/37477845/102348861-d3e51b00-3fe5-11eb-8b07-adc08a48a760.jpg" width="25%">
+```bash
+python record_video.py                                  # record clips (optional helper)
+python extract_gesture_data.py --video videos/hi.mp4 --label Hi --mode sequence --reset   # first gesture only: --reset
+python extract_gesture_data.py --video videos/help.mp4 --label help --mode sequence
+python train_sequence_classifier.py                     # -> model/sequence_classifier/sequence_classifier.tflite
+python extract_gesture_data.py --video videos/ok.mp4 --label ok --mode static
+python train_keypoint_classifier.py                     # -> model/keypoint_classifier/keypoint_classifier.tflite
+python diagnose_label_mismatch.py --model <.tflite> --label <label csv>   # for any IndexError on labels
+```
 
-#### 2.Model training
-Open "[keypoint_classification.ipynb](keypoint_classification.ipynb)" in Jupyter Notebook and execute from top to bottom.<br>
-To change the number of training data classes, change the value of "NUM_CLASSES = 3" <br>and modify the label of "model/keypoint_classifier/keypoint_classifier_label.csv" as appropriate.<br><br>
+New option: `extract_gesture_data.py --sample_fps 20` keeps sequence frames at
+a fixed rate using the video's own timestamps, so a 30-frame training window
+spans the same real time as the app's 20 FPS processing window (see §6).
 
-#### X.Model structure
-The image of the model prepared in "[keypoint_classification.ipynb](keypoint_classification.ipynb)" is as follows.
-<img src="https://user-images.githubusercontent.com/37477845/102246723-69c76a00-3f42-11eb-8a4b-7c6b032b7e71.png" width="50%"><br><br>
+---
 
-### Finger gesture recognition training
-#### 1.Learning data collection
-Press "h" to enter the mode to save the history of fingertip coordinates (displayed as "MODE:Logging Point History").<br>
-<img src="https://user-images.githubusercontent.com/37477845/102249074-4d78fc80-3f45-11eb-9c1b-3eb975798871.jpg" width="60%"><br><br>
-If you press "0" to "9", the key points will be added to "model/point_history_classifier/point_history.csv" as shown below.<br>
-1st column: Pressed number (used as class ID), 2nd and subsequent columns: Coordinate history<br>
-<img src="https://user-images.githubusercontent.com/37477845/102345850-54ede380-3fe1-11eb-8d04-88e351445898.png" width="80%"><br><br>
-The key point coordinates are the ones that have undergone the following preprocessing up to ④.<br>
-<img src="https://user-images.githubusercontent.com/37477845/102244148-49e27700-3f3f-11eb-82e2-fc7de42b30fc.png" width="80%"><br><br>
-In the initial state, 4 types of learning data are included: stationary (class ID: 0), clockwise (class ID: 1), counterclockwise (class ID: 2), and moving (class ID: 4). <br>
-If necessary, add 5 or later, or delete the existing data of csv to prepare the training data.<br>
-<img src="https://user-images.githubusercontent.com/37477845/102350939-02b0c080-3fe9-11eb-94d8-54a3decdeebc.jpg" width="20%">　<img src="https://user-images.githubusercontent.com/37477845/102350945-05131a80-3fe9-11eb-904c-a1ec573a5c7d.jpg" width="20%">　<img src="https://user-images.githubusercontent.com/37477845/102350951-06444780-3fe9-11eb-98cc-91e352edc23c.jpg" width="20%">　<img src="https://user-images.githubusercontent.com/37477845/102350942-047a8400-3fe9-11eb-9103-dbf383e67bf5.jpg" width="20%">
+## 4. Research layer: four architectures, one training pipeline
 
-#### 2.Model training
-Open "[point_history_classification.ipynb](point_history_classification.ipynb)" in Jupyter Notebook and execute from top to bottom.<br>
-To change the number of training data classes, change the value of "NUM_CLASSES = 4" and <br>modify the label of "model/point_history_classifier/point_history_classifier_label.csv" as appropriate. <br><br>
+| architecture | `model.architecture` | encoder |
+|---|---|---|
+| MLP baseline | `mlp` | `[30, 84]` flattened to 2520 → dense layers (no temporal modelling) |
+| GRU | `gru` | stacked (optionally bidirectional) GRU |
+| LSTM | `lstm` | stacked (optionally bidirectional) LSTM — the original model family |
+| GRU+LSTM | `gru_lstm` | GRU stage → LSTM stage |
 
-#### X.Model structure
-The image of the model prepared in "[point_history_classification.ipynb](point_history_classification.ipynb)" is as follows.
-<img src="https://user-images.githubusercontent.com/37477845/102246771-7481ff00-3f42-11eb-8ddf-9e3cc30c5816.png" width="50%"><br>
-The model using "LSTM" is as follows. <br>Please change "use_lstm = False" to "True" when using (tf-nightly required (as of 2020/12/16))<br>
-<img src="https://user-images.githubusercontent.com/37477845/102246817-8368b180-3f42-11eb-9851-23a7b12467aa.png" width="60%">
+All four share the same input tensor, dense head, loss, optimizer, callbacks,
+splits and export code (`sh_research/models/base.py`, `sh_research/training/`),
+so a comparison isolates the temporal encoder.
 
-# Reference
-* [MediaPipe](https://mediapipe.dev/)
+```bash
+# train one architecture over several seeds (uses model/sequence_classifier/sequence_data.csv)
+python scripts/train.py --config configs/gru.yaml --seeds 1 42 123 2026
+python scripts/train.py --config configs/lstm.yaml --set model.hidden_size=128 --set data.sequence_length=20
 
-# Author
-Kazuhito Takahashi(https://twitter.com/KzhtTkhs)
+# leaderboard + plots (mean ± std over seeds, Pareto flag on accuracy vs TFLite latency)
+python scripts/compare.py experiments --out experiments/comparison
 
-# Translation and other improvements
-Nikita Kiselov(https://github.com/kinivi)
- 
-# License 
+# ablation grids (configs/ablations/*.yaml: hidden size, layers/bidirectional, sequence length,
+# one-hand vs two-hand features, optimizer/LR, regularisation, pooling)
+python scripts/ablation.py --config configs/gru.yaml --grid configs/ablations/sequence_length.yaml
+
+# evaluate a run on its held-out test split (or another CSV)
+python scripts/evaluate.py experiments/<run_dir>
+
+# batch=1 latency of all four architectures at [1, 30, 84] (Keras + TFLite)
+python scripts/benchmark_latency.py --n 300
+```
+
+Every run directory (`experiments/<stamp>_<name>_<arch>_s<seed>_<id>/`) contains
+`config.yaml`, `split.json`, `model.keras`, **`model.tflite`** (fixed-batch
+export, self-checked against the label count and against Keras numerically),
+**`labels.csv`** (the repo's label format), `metadata.json` (input shape,
+classes, preprocessing), `history.json`, `results.json` (metrics, latency,
+timing, environment, dataset fingerprint), `confusion_matrix.png`, `history.png`.
+
+Use a run in the app directly, or deploy it as the default model:
+
+```bash
+python app.py --seq_model experiments/<run_dir>          # model.tflite + labels.csv + preprocessor from the run
+python scripts/deploy_model.py experiments/<run_dir>     # -> model/sequence_classifier/*.tflite/*_label.csv (+ .bak)
+```
+
+`configs/default.yaml` lists every parameter with its meaning; defaults equal
+the original project's behaviour. Any key can be overridden with
+`--set section.key=value` on every script and on `app.py`.
+
+**Data note.** The repository ships 138 windows of two classes (`Hi`, `help`).
+That is enough to validate the pipeline end to end but not to rank
+architectures: all four reach 100 % on the 21-sample test split. Collect more
+signs (and more signers — `data.signers_path` enables signer-independent
+splits) before drawing conclusions. `scripts/make_synthetic_dataset.py` +
+`configs/smoke.yaml` provide a synthetic smoke-test dataset only.
+
+---
+
+## 5. Real-time behaviour: 20 FPS scheduler and profiling
+
+`app.py` processes frames at a **fixed rate** (`--target_fps`, default 20 =
+one processed frame every 50 ms) independent of the camera's own rate:
+
+* a capture thread reads the camera continuously into a **latest-frame
+  buffer** (`realtime.max_queue_size: 1`): a slow processor sees fewer,
+  fresher frames instead of a growing backlog;
+* a monotonic-clock scheduler waits for the next 50 ms deadline, re-anchoring
+  (never bursting) when it falls behind; frames older than
+  `stale_frame_max_age_s` are skipped; older buffered frames count as dropped;
+* the sequence window is cleared after `max_missing_frames` hand-less frames
+  (as before) or after a processing stall longer than
+  `max_sequence_gap_intervals` intervals;
+* `--target_fps 0` restores the original synchronous every-frame loop (used by
+  the tests and for video files).
+
+Every stage is timed with `time.monotonic()` around the actual call
+(capture, buffer acquire, frame age, scheduler lateness, image preprocessing,
+MediaPipe landmarks, feature vector, window update, static model, sequence
+model, probability smoothing, stabilisation, speech-event creation, drawing)
+and reported as mean / p50 / p95 / p99 / max on the overlay (`p` key), in the
+console at exit, and as JSON with `--benchmark`:
+
+```bash
+python app.py --benchmark --duration 60          # experiments/realtime/<stamp>_realtime_benchmark.json
+python scripts/benchmark_realtime.py --duration 20              # headless, synthetic landmarks, real TFLite models
+python scripts/benchmark_realtime.py --extractor mediapipe      # headless, real MediaPipe Hands on generated frames
+python scripts/simulate_scheduler.py                            # scheduler + buffer policy under camera jitter/bursts
+```
+
+The report states whether the target rate was **actually sustained** (achieved
+rate ≥ 95 % of target and median tick cost below the interval), names the
+largest bottleneck stage and its share of the loop, and records paper-ready
+metadata (architecture, model config, sequence length, target vs actual FPS,
+dataset fingerprint, seed, hardware, landmark config, thresholds, TTS config).
+Nothing is estimated; every number is measured in that run.
+
+---
+
+## 6. Sequence length vs. frame rate
+
+The sequence classifier consumes one sample per processed frame, so a
+30-frame window spans `30 / target_fps` seconds at run time (1.5 s at 20 FPS)
+while training windows span `30 / recording_fps` seconds (1.0 s for a 30 FPS
+recording). The app prints a **MISMATCH** warning when these differ. To align
+them either extract training data at the processing rate
+(`extract_gesture_data.py --sample_fps 20`, then retrain) or set
+`realtime.target_fps` to the recording rate. `data.sequence_length` and
+`data.sampling_fps` in the research configs let you study shorter windows
+(lower recognition delay) and subsampled training data; the trained model's
+settings are stored in its `metadata.json` and applied by `app.py`.
+
+---
+
+## 7. Speech (TTS) path and latency measurement
+
+Speech is produced from the **stabilised** gesture only (one utterance per
+held sign), through:
+
+1. `PredictionStabilizer` → `StableEvent` (T2, with the confirming frame's
+   capture time T0 and prediction time T1);
+2. `SpeechEventManager` (`tts.mode`: `immediate_word` or `buffered_phrase`;
+   `duplicate_cooldown_ms`, `require_prediction_change`,
+   `minimum_stable_duration_ms`; `label_map` for label → spoken text);
+3. a **bounded queue** (`tts.queue_size`, `overflow_policy`) — the inference
+   loop never waits for audio; events that waited longer than
+   `max_pending_age_ms` are expired instead of spoken;
+4. the TTS worker thread and a backend: `pyttsx3_subprocess` (default — the
+   original one-process-per-word approach, now with measured audio-start
+   timestamps and an optional pre-spawned standby process so interpreter
+   start-up is off the critical path), `pyttsx3` (in-process), `print`, `mock`.
+
+Timestamps T0 (capture) … T7 (playback end) are recorded per spoken word;
+`app.py --benchmark` and `scripts/benchmark_tts.py` report prediction →
+TTS-start, TTS generation, playback-start and total prediction → speech
+latencies (p50 / p95 / p99), plus counts of duplicates suppressed, expired
+and dropped events:
+
+```bash
+python scripts/benchmark_tts.py --out experiments/tts_bench --events 40                 # real pyttsx3 (audio!)
+python scripts/benchmark_tts.py --out experiments/tts_bench --tts mock --events 100     # thread/queue overhead only
+python scripts/benchmark_tts.py --out experiments/tts_bench --compare-prespawn
+python scripts/benchmark_tts.py --out experiments/tts_bench --sweep stabilizer.confidence_threshold=0.5,0.7,0.9
+```
+
+---
+
+## 8. Repository map
+
+| path | role |
+|---|---|
+| `app.py` | live application (camera → prediction → screen + speech), CLI, benchmark writer |
+| `landmark_utils.py` | 84-value combined two-hand feature vector (shared by extraction and inference) |
+| `dataset_utils.py` | CSV dataset / label loaders shared by training scripts and research code |
+| `gesture_output.py` | `choose_gesture`, `GestureStabilizer`, `PredictionStabilizer`, `SpeechWorker` |
+| `camera_utils.py`, `camera_check.py` | camera backend selection (DirectShow/MSMF fallback), diagnostics |
+| `extract_gesture_data.py`, `record_video.py` | dataset creation from videos |
+| `train_keypoint_classifier.py`, `train_sequence_classifier.py` | original training scripts (TFLite export + self-check) |
+| `diagnose_label_mismatch.py` | model/label class-count check |
+| `model/keypoint_classifier/`, `model/sequence_classifier/` | TFLite wrappers, models, label files, datasets |
+| `sh_research/config.py` | typed configuration (YAML + `--set` overrides), defaults = original behaviour |
+| `sh_research/data/` | dataset loading (via `dataset_utils`), preprocessing, splits, synthetic data |
+| `sh_research/models/` | MLP / GRU / LSTM / GRU+LSTM factory with a shared head |
+| `sh_research/training/` | optimizers, schedulers, early stopping, checkpoints, TFLite export |
+| `sh_research/evaluation/` | metrics, latency measurement (Keras and TFLite), plots |
+| `sh_research/experiments/` | run/aggregate/compare/ablate, benchmark metadata |
+| `sh_research/realtime/` | scheduler, frame buffer, capture thread, landmark extractor, `GesturePipeline`, profiling, overlay, simulator |
+| `sh_research/tts/` | backends, worker, speech-event manager, text normalisation, TTS benchmark |
+| `configs/` | shipped configurations (`default`, one per architecture, `realtime`, `smoke`, `ablations/`) |
+| `scripts/` | train / evaluate / compare / ablation / deploy_model / benchmark_* / simulate_scheduler / make_synthetic_dataset |
+| `tests/` | full test suite (`python -m pytest tests/`) |
+| `docs/INTEGRATION_REPORT.md` | audit, integration decisions, measurements |
+| `keypoint_classification*.ipynb`, `point_history_classification.ipynb` | notebooks from the original project (reference only) |
+
+---
+
+## 9. Requirements and known constraints
+
+* Python 3.10+; `pip install -r requirements.txt`.
+* **MediaPipe:** `app.py` uses the legacy `mediapipe.solutions.hands` API,
+  which exists up to MediaPipe 0.10.21 and requires `protobuf<5`. TensorFlow
+  ≥ 2.20 requires `protobuf ≥ 5.28`, so the known-good combination is
+  **TensorFlow ≤ 2.19 + MediaPipe ≤ 0.10.21** (the test suite and benchmarks
+  in this repository were also run under TF 2.19 / MediaPipe 0.10.21 /
+  Keras 3.15). With a newer TensorFlow the research/training code still runs
+  (verified under TF 2.21), but MediaPipe's legacy API does not import.
+* **pyttsx3** needs a speech driver: SAPI5 (Windows), NSSpeechSynthesizer
+  (macOS) or eSpeak (`sudo apt install espeak-ng`, Linux). Without one,
+  `app.py` fails at start-up with an actionable message; use `--no_tts` or
+  `--tts_backend print`.
+* `tf.lite.Interpreter` prints a deprecation notice on TF ≥ 2.20 (LiteRT);
+  it still works.
+
+---
+
+## Credits and license
+
+Original hand-gesture recognition and training pipeline: Kazuhito Takahashi
+(https://twitter.com/KzhtTkhs), English translation and improvements by Nikita
+Kiselov (https://github.com/kinivi). Speaking Hands two-hand sign pipeline,
+sequence classifier, speech output and the research/realtime layer: the
+Speaking Hands team (https://github.com/Mostafa-elrefaee/Speaking-Hands).
+
+Reference: [MediaPipe](https://mediapipe.dev/).
+
 hand-gesture-recognition-using-mediapipe is under [Apache v2 license](LICENSE).

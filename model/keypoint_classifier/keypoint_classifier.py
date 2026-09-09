@@ -17,6 +17,14 @@ class KeyPointClassifier(object):
         self.input_details = self.interpreter.get_input_details()
         self.output_details = self.interpreter.get_output_details()
 
+    def predict_proba(self, landmark_list):
+        """Full softmax vector (numpy [num_classes])."""
+        self.interpreter.set_tensor(self.input_details[0]['index'],
+                                    np.array([landmark_list], dtype=np.float32))
+        self.interpreter.invoke()
+        result = self.interpreter.get_tensor(self.output_details[0]['index'])
+        return np.squeeze(result).astype(np.float32).reshape(-1)
+
     def __call__(
         self,
         landmark_list,

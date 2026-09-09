@@ -1,0 +1,24 @@
+# Fast synthetic-data smoke configuration (CI / first run without real data).
+#   python scripts/make_synthetic_dataset.py data/synthetic_smoke
+#   python scripts/train.py --config configs/smoke.yaml
+name: smoke
+output_dir: experiments/smoke
+seeds: [1, 2]
+latency_samples: 30
+data:
+  path: data/synthetic_smoke/sequence_data.csv
+  label_path: data/synthetic_smoke/sequence_classifier_label.csv
+  signers_path: data/synthetic_smoke/signers.json
+  dataset_id: synthetic-smoke
+model:
+  architecture: gru
+  hidden_size: 16
+  num_layers: 1
+  dense_layers: [16]
+  mlp_hidden_layers: [32]
+training:
+  epochs: 3
+  verbose: 0
+  early_stopping_patience: 0
+tts:
+  backend: mock

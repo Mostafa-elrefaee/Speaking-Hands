@@ -4,12 +4,16 @@
 Tests for gesture_output.py using scripted fake per-frame predictions.
 No camera, no models, no audio hardware needed:  python -m pytest -q
 """
+import os
+import sys
 import time
 import threading
 
 import pytest
 
-from gesture_output import choose_gesture, GestureStabilizer, SpeechWorker
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from gesture_output import choose_gesture, GestureStabilizer, SpeechWorker  # noqa: E402
 
 STABLE = 8  # mirrors app.STABLE_FRAMES
 

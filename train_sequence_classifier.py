@@ -36,6 +36,7 @@ from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 
 from landmark_utils import NUM_LANDMARKS, COORDS_PER_LANDMARK, NUM_HANDS, TOTAL_FEATURES
+from dataset_utils import load_labels, load_sequence_csv, check_label_ids
 
 
 def get_args():
@@ -67,30 +68,11 @@ def get_args():
     return parser.parse_args()
 
 
-def load_labels(label_csv_path):
-    with open(label_csv_path, encoding="utf-8-sig") as f:
-        return [row[0] for row in csv.reader(f) if row]
-
-
+# load_labels / load_dataset now live in dataset_utils.py (shared with
+# train_keypoint_classifier.py and sh_research so the CSV format is parsed
+# by exactly one implementation).
 def load_dataset(data_csv_path, seq_length, num_features):
-    raw = np.loadtxt(data_csv_path, delimiter=",", dtype="float32")
-    if raw.ndim == 1:  # only one sample in the file
-        raw = raw.reshape(1, -1)
-
-    y = raw[:, 0].astype(int)
-    x_flat = raw[:, 1:]
-
-    expected_len = seq_length * num_features
-    if x_flat.shape[1] != expected_len:
-        raise ValueError(
-            f"Each row has {x_flat.shape[1]} feature values, but "
-            f"seq_length ({seq_length}) x num_features ({num_features}) "
-            f"= {expected_len}. Pass the same --seq_length you used in "
-            f"extract_gesture_data.py."
-        )
-
-    x = x_flat.reshape(-1, seq_length, num_features)
-    return x, y
+    return load_sequence_csv(data_csv_path, seq_length, num_features)
 
 
 def build_model(seq_length, num_features, num_classes, cell, units, dropout,
@@ -136,19 +118,8 @@ def main():
         print("WARNING: very little data per class -- collect more videos "
               "for anything beyond a quick smoke test.")
 
-    present_ids = set(np.unique(y).tolist())
-    expected_ids = set(range(num_classes))
-    unknown_ids = present_ids - expected_ids
-    if unknown_ids:
-        raise SystemExit(
-            f"Found label id(s) {sorted(unknown_ids)} in {args.data_csv} "
-            f"that have no matching row in {args.label_csv} (which only "
-            f"defines ids 0-{num_classes - 1}). Fix the label file (or "
-            f"re-extract) before training."
-        )
-    missing_ids = expected_ids - present_ids
-    if missing_ids:
-        missing_names = [labels[i] for i in sorted(missing_ids)]
+    missing_names = check_label_ids(y, labels, args.data_csv, args.label_csv)
+    if missing_names:
         print(f"WARNING: these labels have ZERO training samples and will "
               f"never be predicted correctly: {missing_names}")
 

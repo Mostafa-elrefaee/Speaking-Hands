@@ -137,3 +137,8 @@ dmypy.json
 
 myenv/
 videos/
+# Speaking Hands research outputs
+experiments/
+data/synthetic_smoke/
+model/**/*.bak
+model/sequence_classifier/deployed_from.json

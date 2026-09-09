@@ -1,0 +1,6 @@
+# One-hand vs both hands, and temporal subsampling of the stored windows.
+name: feat_fps
+grid:
+  data.feature_groups: [[], [right_hand], [left_hand]]
+  data.sampling_fps: [30, 15]
+seeds: [1, 42, 123]

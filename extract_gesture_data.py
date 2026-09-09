@@ -58,6 +58,7 @@ import cv2 as cv
 import mediapipe as mp
 
 from landmark_utils import build_combined_vector, TOTAL_FEATURES
+from dataset_utils import load_labels as _load_labels
 
 
 def get_args():
@@ -93,6 +94,13 @@ def get_args():
                          help="Step between sequence windows (sequence mode "
                               "only). Defaults to seq_length (no overlap).")
 
+    parser.add_argument("--sample_fps", type=float, default=0.0,
+                         help="Sequence mode only: keep frames at this rate "
+                              "(timestamp-based, using the video's own FPS) "
+                              "so training windows span the same real time "
+                              "as app.py's --target_fps processing rate. "
+                              "0 = keep every frame (default, previous "
+                              "behaviour).")
     parser.add_argument("--frame_skip", type=int, default=1,
                          help="Only process every Nth frame. Use >1 for "
                               "long static videos to avoid near-duplicate "
@@ -145,10 +153,7 @@ def get_args():
 # ---------------------------------------------------------------------------
 
 def load_labels(label_csv_path):
-    if not os.path.exists(label_csv_path):
-        return []
-    with open(label_csv_path, encoding="utf-8-sig") as f:
-        return [row[0] for row in csv.reader(f) if row]
+    return _load_labels(label_csv_path, missing_ok=True)
 
 
 def get_or_create_label_id(label_name, label_csv_path):
@@ -197,6 +202,15 @@ def extract_from_video(video_path, label_id, label_name, args, hands, csv_writer
     sequence_buffer = []  # one shared buffer -- each entry is a combined 84-value frame
     stride = args.stride or args.seq_length
     frames_with_no_hand = 0
+    video_fps = cap.get(cv.CAP_PROP_FPS) or 0.0
+    # Timestamp-based subsampling for sequence mode (--sample_fps): keep the
+    # first frame at/after each 1/sample_fps boundary of the video timeline.
+    sample_interval = (1.0 / args.sample_fps) if (args.mode == "sequence"
+                                                  and args.sample_fps > 0) else 0.0
+    next_sample_t = 0.0
+    if sample_interval and video_fps <= 0:
+        print("  !! video reports no FPS; --sample_fps ignored for this file")
+        sample_interval = 0.0
 
     while True:
         ret, frame = cap.read()
@@ -206,6 +220,12 @@ def extract_from_video(video_path, label_id, label_name, args, hands, csv_writer
         if args.mode == "static" and frame_idx % args.frame_skip != 0:
             frame_idx += 1
             continue
+        if sample_interval:
+            t = frame_idx / video_fps
+            if t + 1e-9 < next_sample_t:
+                frame_idx += 1
+                continue
+            next_sample_t += sample_interval
 
         if args.flip:
             frame = cv.flip(frame, 1)
@@ -250,6 +270,10 @@ def extract_from_video(video_path, label_id, label_name, args, hands, csv_writer
         frame_idx += 1
 
     cap.release()
+    if video_fps:
+        print(f"  (video FPS {video_fps:.2f}"
+              + (f", sampled at {args.sample_fps:g} FPS" if sample_interval else "")
+              + ")")
     if frames_with_no_hand:
         print(f"  ({frames_with_no_hand} frame(s) had no hand detected and "
               f"were skipped)")

@@ -1,6 +1,16 @@
-mediapipe
+# Known-good combination (also the one the tests/benchmarks were run with):
+#   TensorFlow 2.19 + MediaPipe 0.10.21 + protobuf 4.25 + numpy 1.26 + Keras 3.x
+# app.py needs MediaPipe's legacy `solutions.hands` API (last version: 0.10.21,
+# requires protobuf<5). TensorFlow >= 2.20 requires protobuf >= 5.28 and
+# therefore cannot share an environment with it.
+tensorflow>=2.16,<2.20
+mediapipe<=0.10.21
+protobuf<5
+numpy<2
 opencv-python
-tensorflow
-numpy
 pyttsx3
-pytest  # tests only
+scikit-learn      # train/test splits (both training scripts and sh_research)
+PyYAML            # configs/*.yaml
+pandas            # leaderboards (scripts/compare.py, ablation.py)
+matplotlib        # confusion matrices, training curves, comparison plots
+pytest            # tests only
